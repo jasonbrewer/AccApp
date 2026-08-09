@@ -9,8 +9,10 @@ Ollama is not required — these exercise the deterministic rule + fallback path
 which is the behavior you must never break (the app has to work with AI off).
 """
 
+import io
 import os
 import re
+import sqlite3
 import sys
 
 os.environ["LEDGER_DB"] = "_test.sqlite"
@@ -77,6 +79,145 @@ client.get("/transactions").status_code == 200 or fail("transactions page errore
 for raw, want in [("$1,234.56", 123456), ("(12.34)", -1234), ("-47.31", -4731), ("89", 8900)]:
     got = A.parse_amount_to_cents(raw)
     got == want or fail(f"parse_amount_to_cents({raw!r}) => {got}, expected {want}")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — one per fix in the import-safety / escaping batch.
+# ---------------------------------------------------------------------------
+
+def import_csv(text, name="x.csv", account_id="1"):
+    """Post an in-memory CSV through the real import route."""
+    return client.post(
+        "/import",
+        data={"account_id": account_id, "file": (io.BytesIO(text.encode()), name)},
+        content_type="multipart/form-data")
+
+
+# 8. money() is integer math (invariant 1) and formats exactly as before
+A.money(-1500) == "-$15.00" or fail(f"money(-1500) => {A.money(-1500)!r}")
+A.money(29) == "$0.29" or fail(f"money(29) => {A.money(29)!r}")
+for c in (0, 1, 29, 99, 100, 1500, -1500, 123456, -98765, 100000000):
+    old = ("-" if c < 0 else "") + f"${abs(c)/100:,.2f}"   # the old float formatting
+    A.money(c) == old or fail(f"money({c}) => {A.money(c)!r}, expected {old!r}")
+# ...and beyond float's 53-bit mantissa the old abs(cents)/100 path loses cents,
+# which is what makes this more than a style fix.
+A.money(99999999999999999) == "$999,999,999,999,999.99" or fail(
+    f"money() went through a float: {A.money(99999999999999999)!r}")
+A.money(2**53 + 1) == "$90,071,992,547,409.93" or fail(
+    f"money() went through a float: {A.money(2**53 + 1)!r}")
+
+# 9. non-finite amounts are rejected, not crashed on
+for raw, want in [("1.15", 115), ("4.35", 435), ("8.87", 887), ("0.29", 29),
+                  ("nan", None), ("Infinity", None), ("-inf", None), ("NaN", None)]:
+    try:
+        got = A.parse_amount_to_cents(raw)
+    except Exception as e:                                  # noqa: BLE001
+        fail(f"parse_amount_to_cents({raw!r}) raised {e!r}")
+    got == want or fail(f"parse_amount_to_cents({raw!r}) => {got}, expected {want}")
+
+# 10. three identical purchases stay three rows, and re-import still dedups
+COFFEE = "Date,Description,Amount\n" + "02/02/2026,DAILY GRIND COFFEE,-5.00\n" * 3
+r = import_csv(COFFEE, "coffee.csv")
+b"Imported 3 new" in r.data or fail("3 identical coffees should import as 3 new rows")
+b"0 duplicates skipped" in r.data or fail("a valid new row must count as new, not duplicate")
+
+
+def coffee_state():
+    row = conn.execute(
+        """SELECT COUNT(*) n, COALESCE(SUM(amount_cents), 0) total
+             FROM transactions WHERE description='DAILY GRIND COFFEE'""").fetchone()
+    keys = {r["dedup_key"] for r in conn.execute(
+        "SELECT dedup_key FROM transactions WHERE description='DAILY GRIND COFFEE'")}
+    return row["n"], row["total"], keys
+
+
+n, total, keys_first = coffee_state()
+(n, total) == (3, -1500) or fail(f"expected 3 coffees totalling -1500, got {n} / {total}")
+
+r = import_csv(COFFEE, "coffee.csv")
+b"Imported 0 new" in r.data or fail("re-importing the same file must add nothing")
+n, total, keys_second = coffee_state()
+(n, total) == (3, -1500) or fail(f"re-import changed the ledger: {n} rows / {total} cents")
+keys_first == keys_second or fail("dedup sequence did not regenerate identically on re-import")
+
+# 11. only the dedup_key UNIQUE violation counts as a duplicate
+existing = conn.execute("SELECT dedup_key FROM transactions LIMIT 1").fetchone()["dedup_key"]
+INSERT = """INSERT INTO transactions
+            (account_id, txn_date, description, merchant_norm, amount_cents,
+             dedup_key, created_at)
+            VALUES (?,?,?,?,?,?,?)"""
+cases = [
+    # (params, should is_dedup_conflict() call it a duplicate?)
+    ((1, "2026-02-02", "X", "X", -1, existing, "now"), True),    # UNIQUE dedup_key
+    ((1, "2026-02-02", "X", "X", -1, None, "now"), False),       # NOT NULL dedup_key
+    ((9999, "2026-02-02", "X", "X", -1, "fk-probe", "now"), False),  # FK: no such account
+]
+for params, want_dup in cases:
+    try:
+        conn.execute(INSERT, params)
+        conn.rollback()
+        fail(f"expected an IntegrityError for {params!r}")
+    except sqlite3.IntegrityError as err:
+        conn.rollback()
+        A.is_dedup_conflict(err) == want_dup or fail(
+            f"is_dedup_conflict({err}) => {A.is_dedup_conflict(err)}, expected {want_dup}")
+
+# 12. unparseable dates are skipped, never stored raw
+A.normalize_date("03/04/2026") == "2026-03-04" or fail("US-first parsing must be preserved")
+A.normalize_date("2026-03-04") == "2026-03-04" or fail("ISO dates should parse")
+A.normalize_date("31/12/2026") == "2026-12-31" or fail("day-first fallback should still parse")
+A.normalize_date("last tuesday") is None or fail("unparseable date must return None")
+A.normalize_date("") is None or fail("empty date must return None")
+
+r = import_csv("Date,Description,Amount\n"
+               "someday,BAD DATE MERCHANT,-1.00\n"
+               "03/04/2026,GOOD DATE MERCHANT,-2.00\n", "dates.csv")
+b"Imported 1 new" in r.data or fail("only the row with a readable date should import")
+b"1 rows unreadable" in r.data or fail("the unparseable date should be counted as skipped")
+conn.execute("SELECT COUNT(*) n FROM transactions WHERE description='BAD DATE MERCHANT'"
+             ).fetchone()["n"] == 0 or fail("a row with an unparseable date must not be stored")
+conn.execute("SELECT txn_date FROM transactions WHERE description='GOOD DATE MERCHANT'"
+             ).fetchone()["txn_date"] == "2026-03-04" or fail("valid date must store as YYYY-MM-DD")
+
+# 13. user/CSV text is HTML-escaped on the way out
+import_csv("Date,Description,Amount\n"
+           "03/05/2026,<script>alert(1)</script> SHOP,-9.99\n", "xss.csv")
+page = client.get("/transactions").data
+b"&lt;script&gt;" in page or fail("a description with markup should render escaped")
+b"<script>alert" not in page or fail("raw <script> from CSV data reached the page")
+
+# ...including a note with a double quote, which used to truncate the value= attribute
+first = conn.execute(
+    "SELECT id FROM transactions WHERE reviewed=0 ORDER BY txn_date, id LIMIT 1").fetchone()
+conn.execute("UPDATE transactions SET note=? WHERE id=?", ('5" tripod', first["id"]))
+conn.commit()
+b'value="5&quot; tripod"' in client.get("/review").data or fail(
+    'a note containing " must render as value="5&quot; tripod"')
+
+# ...and survives a confirm round-trip intact
+tid = conn.execute(
+    "SELECT id FROM transactions WHERE reviewed=0 ORDER BY txn_date, id LIMIT 1").fetchone()["id"]
+client.post("/review", data={"txn_id": [str(tid)], f"cat_{tid}": "Equipment",
+                             f"use_{tid}": "business", f"note_{tid}": '5" tripod'})
+got = conn.execute("SELECT note FROM transactions WHERE id=?", (tid,)).fetchone()["note"]
+got == '5" tripod' or fail(f'note round-tripped as {got!r}, expected \'5" tripod\'')
+
+# 14. a bogus `use` falls back to the account default instead of vanishing
+tid = conn.execute(
+    "SELECT id FROM transactions WHERE reviewed=0 ORDER BY txn_date, id LIMIT 1").fetchone()["id"]
+client.post("/review", data={"txn_id": [str(tid)], f"cat_{tid}": "Equipment",
+                             f"use_{tid}": "bogus", f"note_{tid}": ""})
+stored = conn.execute("SELECT use FROM transactions WHERE id=?", (tid,)).fetchone()["use"]
+stored == "business" or fail(f"bogus use stored as {stored!r}, expected the account default")
+
+# the dashboard only totals business + personal, so every row must land in one of them
+rows = conn.execute(
+    """SELECT t.use, a.default_use, t.amount_cents FROM transactions t
+         JOIN accounts a ON a.id=t.account_id WHERE t.amount_cents < 0""").fetchall()
+counted = sum(-r["amount_cents"] for r in rows if A.txn_use(r) in A.VALID_USES)
+counted == sum(-r["amount_cents"] for r in rows) or fail(
+    "some spending is not counted in the dashboard's business/personal totals")
+client.get("/").status_code == 200 or fail("dashboard errored after the bogus-use write")
 
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")
