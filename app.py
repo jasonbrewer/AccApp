@@ -17,8 +17,10 @@ Next milestones: transfers, splits, the Monthly Nut, and the document dump / OCR
 """
 
 import csv
+import html
 import io
 import os
+import sqlite3
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -35,13 +37,27 @@ app = Flask(__name__)
 
 # ----------------------------- helpers -----------------------------------
 
+VALID_USES = ("business", "personal")
+
+
 def get_conn():
     return db.init_db(DB_PATH)
 
 
+def esc(value):
+    """The one escape hatch for anything user- or CSV-provided.
+
+    Pages are f-strings handed to `body|safe`, so nothing is escaped for us.
+    Every interpolated value that didn't come from this file goes through here.
+    """
+    return html.escape("" if value is None else str(value), quote=True)
+
+
 def money(cents):
+    # Integer math only — invariant 1. abs(cents)/100 would put money on a float.
     sign = "-" if cents < 0 else ""
-    return f"{sign}${abs(cents)/100:,.2f}"
+    whole, frac = divmod(abs(cents), 100)
+    return f"{sign}${whole:,}.{frac:02d}"
 
 
 def parse_amount_to_cents(raw):
@@ -54,8 +70,21 @@ def parse_amount_to_cents(raw):
         val = Decimal(s)
     except InvalidOperation:
         return None
+    if not val.is_finite():
+        # Decimal happily parses 'nan' / 'Infinity'; int() then blows up.
+        return None
     cents = int((val * 100).to_integral_value())
     return -abs(cents) if neg else cents
+
+
+def is_dedup_conflict(err):
+    """True only for the dedup_key UNIQUE violation — i.e. an already-imported row.
+
+    Everything else (NOT NULL, foreign key, disk) is a real failure and must not
+    be quietly counted as a duplicate.
+    """
+    msg = str(err).lower()
+    return "unique constraint failed" in msg and "dedup_key" in msg
 
 
 def detect_columns(header):
@@ -202,7 +231,7 @@ def dashboard():
 
     if ranked:
         rowshtml = "".join(
-            f"<tr><td>{c}</td><td class='r num'>{money(-v['business'])}</td>"
+            f"<tr><td>{esc(c)}</td><td class='r num'>{money(-v['business'])}</td>"
             f"<td class='r num'>{money(-v['personal'])}</td>"
             f"<td class='r num'>{money(-(v['business']+v['personal']))}</td></tr>"
             for c, v in ranked
@@ -260,7 +289,13 @@ def do_import():
         cat_id = db.category_map(conn)
 
         added = dups = skipped = 0
-        for row in data:
+        # Three identical $5 coffees on one day are three purchases, not one.
+        # Counting occurrences of each base key within THIS file and appending
+        # the index keeps them distinct while a re-import of the same file
+        # regenerates #1/#2/#3 identically and still dedups (invariant 7).
+        # This does assume stable row ordering across re-imports of a file.
+        seen = {}
+        for row in data:            # file order — the sequence must be stable
             try:
                 raw_date = row[cols["date"]].strip()
                 desc = row[cols["desc"]].strip()
@@ -268,13 +303,15 @@ def do_import():
             except IndexError:
                 skipped += 1
                 continue
-            if cents is None or not desc:
+            date = normalize_date(raw_date)
+            if cents is None or not desc or date is None:
                 skipped += 1
                 continue
 
-            date = normalize_date(raw_date)
             merchant = normalize_merchant(desc)
-            dedup = f"{account_id}|{date}|{cents}|{desc}"
+            base = f"{account_id}|{date}|{cents}|{desc}"
+            seen[base] = seen.get(base, 0) + 1
+            dedup = f"{base}#{seen[base]}"
 
             guess = cz.categorize(desc, cents, merchant)
             cid = cat_id.get(guess["category"], cat_id["Uncategorized"])
@@ -288,8 +325,10 @@ def do_import():
                     (account_id, date, desc, merchant, cents, guess["use"], cid,
                      guess["source"], guess["confidence"], batch_id, dedup, now))
                 added += 1
-            except Exception:      # UNIQUE dedup_key -> already imported
-                dups += 1
+            except sqlite3.IntegrityError as err:
+                if not is_dedup_conflict(err):
+                    raise      # NOT NULL / FK / anything else is a real failure
+                dups += 1      # this exact row of this file is already imported
 
         conn.execute("UPDATE import_batches SET row_count=?, dup_count=? WHERE id=?",
                      (added, dups, batch_id))
@@ -303,7 +342,8 @@ def do_import():
         return page(body, "import")
 
     opts = "".join(
-        f"<option value={a['id']}>{a['name']} — {a['default_use']}</option>" for a in accounts)
+        f"<option value=\"{a['id']}\">{esc(a['name'])} — {esc(a['default_use'])}</option>"
+        for a in accounts)
     body = f"""
       <h1>Import a statement</h1>
       <p class=sub>Drop in a bank or credit-card CSV. Duplicates are detected automatically,
@@ -324,9 +364,19 @@ def review():
         ids = request.form.getlist("txn_id")
         cat_id = db.category_map(conn)
         for tid in ids:
+            row = conn.execute(
+                """SELECT t.merchant_norm, a.default_use
+                     FROM transactions t JOIN accounts a ON a.id=t.account_id
+                    WHERE t.id=?""", (tid,)).fetchone()
+            if not row:
+                continue
             catname = request.form.get(f"cat_{tid}")
             use = request.form.get(f"use_{tid}")
             note = request.form.get(f"note_{tid}", "").strip()
+            if use not in VALID_USES:
+                # Anything else would be stored and then silently dropped from the
+                # dashboard, which only totals business + personal.
+                use = row["default_use"]
             cid = cat_id.get(catname, cat_id["Uncategorized"])
             conn.execute(
                 """UPDATE transactions
@@ -334,8 +384,7 @@ def review():
                    WHERE id=?""",
                 (cid, use, note, tid))
             # learn: this merchant -> this category/use, so next time it's rule-matched
-            row = conn.execute("SELECT merchant_norm FROM transactions WHERE id=?", (tid,)).fetchone()
-            if row and catname != "Uncategorized":
+            if catname != "Uncategorized":
                 conn.execute(
                     """INSERT INTO merchant_rules(merchant_norm, category_id, use, updated_at)
                        VALUES (?,?,?,?)
@@ -366,15 +415,15 @@ def review():
     def card(t):
         suggested = t["catname"] or "Uncategorized"
         opts = "".join(
-            f"<option {'selected' if c==suggested else ''}>{c}</option>" for c in cats)
+            f"<option {'selected' if c==suggested else ''}>{esc(c)}</option>" for c in cats)
         use = txn_use(t)
         src = {"rule": "matched a learned rule", "ai": f"AI suggestion · {int((t['ai_confidence'] or 0)*100)}%",
                "none": "no match — pick one", "user": "you set this"}.get(t["category_source"], "")
         return f"""
           <div class=rev>
             <div class=top>
-              <div><div class=desc>{t['description']}</div>
-                   <div class=meta>{t['txn_date']} · {t['acct']}</div></div>
+              <div><div class=desc>{esc(t['description'])}</div>
+                   <div class=meta>{esc(t['txn_date'])} · {esc(t['acct'])}</div></div>
               <div class='amt num'>{money(t['amount_cents'])}</div>
             </div>
             <input type=hidden name=txn_id value={t['id']}>
@@ -389,7 +438,7 @@ def review():
             </div>
             <div class=field>
               <label class=lbl>Note</label>
-              <input type=text name=note_{t['id']} value="{t['note']}" placeholder="e.g. tripod mounting screw">
+              <input type=text name=note_{t['id']} value="{esc(t['note'])}" placeholder="e.g. tripod mounting screw">
             </div>
           </div>"""
 
@@ -419,13 +468,14 @@ def transactions():
     trs = ""
     for t in rows:
         use = txn_use(t)
-        upill = f"<span class='pill {'b' if use=='business' else 'p'}'>{use.title()}</span>"
+        upill = f"<span class='pill {'b' if use=='business' else 'p'}'>{esc(use.title())}</span>"
         state = ("<span class='pill settled'>Reviewed</span>" if t["reviewed"]
                  else "<span class='pill review'>Needs review</span>")
-        note = f"<div class=meta style='color:var(--muted);font-size:12px'>{t['note']}</div>" if t["note"] else ""
-        trs += (f"<tr><td>{t['txn_date']}</td>"
-                f"<td>{t['description']}{note}</td>"
-                f"<td>{t['catname'] or 'Uncategorized'}</td>"
+        note = (f"<div class=meta style='color:var(--muted);font-size:12px'>{esc(t['note'])}</div>"
+                if t["note"] else "")
+        trs += (f"<tr><td>{esc(t['txn_date'])}</td>"
+                f"<td>{esc(t['description'])}{note}</td>"
+                f"<td>{esc(t['catname'] or 'Uncategorized')}</td>"
                 f"<td>{upill}</td><td>{state}</td>"
                 f"<td class='r num'>{money(t['amount_cents'])}</td></tr>")
     body = f"""<h1>Transactions</h1>
@@ -436,12 +486,18 @@ def transactions():
 
 
 def normalize_date(raw):
+    """Return YYYY-MM-DD, or None if nothing recognizes it.
+
+    US-first on purpose: 03/04/2026 is March 4. Ambiguity is resolved, not
+    rejected — only genuinely unparseable dates return None, and txn_date is
+    documented as YYYY-MM-DD so a raw string must never be stored there.
+    """
     for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d/%m/%Y", "%m-%d-%Y"):
         try:
             return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
-    return raw  # leave as-is if unrecognized
+    return None
 
 
 if __name__ == "__main__":
