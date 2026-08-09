@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+ledger_*.sqlite*
+_test.sqlite*
+*.csv
+!sample_statement.csv
