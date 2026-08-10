@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "footage-pipeline"
+version = "0.1.0"
+description = "Footage pipeline — backup stage (copy + verify + manifest) with a local web UI."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "xxhash==3.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "httpx==0.28.1",
+]
+
+[project.scripts]
+footage-pipeline = "footage_pipeline.web.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/footage_pipeline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
