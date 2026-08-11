@@ -1,139 +1,74 @@
-# Footage Pipeline — backup stage
+# LocalLedger — Milestone 1
 
-The first slice of a macOS footage pipeline. This slice does one job and does it
-carefully: **mirror a card or folder to a backup drive, verify every byte with
-xxHash64, and write a manifest saying exactly what happened.**
+A local, private personal + business ledger. Drop in a bank/credit CSV, let it
+categorize, then confirm and reconcile two transactions at a time. **Everything
+runs on your machine.** The browser is only the window — no data leaves your Mac,
+and it runs fine on macOS Ventura.
 
-Nothing here talks to DaVinci Resolve, any external API, or a database. Later
-stages build on this skeleton.
-
-> This repository also contains **LocalLedger**, an unrelated project — see
-> [`README-localledger.md`](README-localledger.md).
-
-## Install
-
-Python 3.11+. From the repo root:
+## Run it
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"      # fastapi, uvicorn, xxhash (+ pytest for tests)
+cd localledger
+pip3 install flask          # only dependency
+python3 app.py
 ```
 
-Dependencies are pinned in `pyproject.toml` and deliberately minimal.
+Then open <http://127.0.0.1:5000> and click **Import** → choose *Business Checking*
+→ upload `sample_statement.csv` to see the whole loop with realistic data.
 
-## Run
+To point at your own data, just import your bank's CSV. A new database file
+`ledger_2026.sqlite` is created next to `app.py` (one file per year).
+
+## The local AI is optional
+
+With **Ollama** installed and running, unknown merchants get a suggested category;
+without it, you get rule-based matching plus manual review, and the app is fully
+usable. The dashboard shows whether it's connected.
 
 ```bash
-footage-pipeline               # or: python -m footage_pipeline.web.app
+# optional — enables AI suggestions, still 100% local
+brew install ollama        # or download from ollama.com
+ollama pull llama3.2       # or qwen2.5 / mistral
+ollama serve
 ```
 
-Then open <http://127.0.0.1:8765>.
+The model name lives at the top of `categorizer.py` (`DEFAULT_MODEL`).
+The app only ever calls `http://localhost:11434` — your own machine. Nothing is
+sent to any cloud service, ever. You can confirm that by running it with your
+network off.
 
-1. **Set the destination** once — the "backup root". It's remembered in a local
-   JSON settings file.
-2. **Choose a source** folder for this run. The last one is pre-filled, but the
-   source is always picked fresh.
-3. **Start backup.** Progress updates live; a report card lands at the end with
-   the counts, PASS/FAIL, and the manifest path.
+## What this build does
 
-Both pickers open the real macOS "choose folder" dialog via `osascript`, because
-a browser's `<input webkitdirectory>` never exposes an absolute filesystem path
-and this app needs the real one. On non-macOS the picker returns HTTP 501 and the
-UI falls back to typing a path — handy for development, and the engine itself is
-fully cross-platform.
+- **Import** a bank/credit CSV, with automatic column detection and
+  **duplicate detection** (re-importing an overlapping statement is safe).
+- **Categorize** each transaction: learned rule → local Ollama → "Uncategorized".
+- **Review two at a time** — confirm or change the category and business/personal
+  use. Every confirmation **teaches a rule**, so the app needs you less over time.
+- **Dashboard** with spending by category, split business vs. personal.
 
-## What the backup guarantees
+## How it's built (and why it ports later)
 
-**Straight mirror.** A file's destination is the backup root joined with its path
-*relative to the chosen source root*. Nothing is flattened, renamed, or filtered
-— all files and subfolders, including dotfiles and sidecars, byte for byte.
+Three files, with a deliberate boundary:
 
-**Nothing is destroyed.** The source is only ever opened for reading. Existing
-destination files are never overwritten or deleted: new files are created with an
-exclusive `open(..., "xb")`, which fails rather than clobbering.
+- `db.py` — SQLite schema + seed data. **This is the durable core.** The same
+  `.sqlite` file and schema open unchanged in a future native (Swift/GRDB) app.
+  Money is stored as integer cents. Stub tables for transfers, splits, documents,
+  and attachments already exist so later milestones need no migration.
+- `categorizer.py` — the **only** place the AI lives, behind one small interface.
+  Today it points at Ollama. If you ever ship on the Mac App Store (where an
+  external Ollama server is a review problem), you swap *only this file* for a
+  bundled on-device model. Nothing else changes.
+- `app.py` — the local web UI (import, review, transactions, dashboard).
 
-**Every file is verified.** The source is hashed while it is copied (one pass,
-streamed in 4 MB chunks so a 200 GB card never lands in RAM), then the
-destination is read back and hashed, and the two must match. Modification times
-are preserved (`copystat`).
+## Roadmap (next milestones)
 
-**Decisions come from hashes, not bookkeeping.** For each file:
+2. **Document dump** — drop a folder of receipts / PDFs / emails; extract text
+   locally (Apple Vision for images, direct text for PDFs/`.eml`), then match each
+   to a transaction by amount + date + merchant for you to confirm visually.
+3. **Transfers & splits** — two-sided transfer matching; one line split across
+   categories / business+personal.
+4. **The Monthly Nut** — Must Pay / Must Buy / Optional, business & personal.
+5. **Reconciliation** — mark transactions cleared against a statement balance.
 
-| Destination | Result |
-|---|---|
-| absent | **COPIED** — copy, then verify |
-| present, hash matches | **SKIPPED** — already backed up |
-| present, hash differs | **CONFLICT** — left completely untouched, recorded, run continues |
-| error (I/O, permissions, disconnect) | **FAILED** — recorded, run continues |
-
-Manifests are output only. The engine never reads a previous one to decide
-whether to copy — delete a file at the destination and the next run copies it
-again, whatever an old manifest claims.
-
-**Symlinks are skipped, never followed** (no loops), and listed in the report.
-
-**Pre-flight.** Before copying, the run sizes the work and checks free space at
-the destination. If there isn't room it refuses to start and copies nothing.
-
-**A run ends FAIL** if there is any conflict or any failure. Re-running resumes
-naturally — everything already verified is skipped.
-
-## Manifests
-
-One per run, under `<backup_root>/_backup_manifests/<timestamp>/`:
-
-- `manifest.json` — run metadata (timestamps, source, destination, totals) and
-  one row per file: relative path, size, source hash, destination hash, status,
-  and any error.
-- `run.log` — the same run in human-readable form.
-
-## Layout
-
-```
-src/footage_pipeline/
-  config.py            persisted settings (local JSON — no database)
-  logging_setup.py     shared logging + per-run log files
-  backup/core.py       UI-agnostic copy + verify + manifest engine
-  backup/manifest.py   manifest read/write
-  web/app.py           FastAPI endpoints + native folder picker
-  web/static/          frontend (plain HTML/CSS/JS)
-scripts/make_test_tree.py   generates a nested dummy tree for testing
-tests/test_backup_core.py   scenario tests T1-T5
-```
-
-`backup/core.py` imports nothing from the web layer and knows nothing about
-HTTP. It takes two paths and an optional progress callback and returns a result
-object — later pipeline stages reuse it directly, and the web layer is a thin
-caller with no copy logic of its own.
-
-Settings live at `~/Library/Application Support/FootagePipeline/settings.json`.
-Set `FOOTAGE_PIPELINE_SETTINGS` to point somewhere else.
-
-## Tests
-
-```bash
-python scripts/make_test_tree.py /tmp/footage_src     # optional: eyeball a tree
-pytest
-```
-
-The suite builds its own tree (nested folders, dotfiles, sidecars, spaces in
-names, an empty file, a ~50 MB file, and symlinks) and covers:
-
-- **T1** fresh backup into an empty destination → all COPIED and verified, PASS
-- **T2** immediate re-run → all SKIPPED, zero copies, PASS
-- **T3** a tampered destination file → CONFLICT, destination untouched, rest
-  SKIPPED, FAIL
-- **T4** a write failure → recorded, other files still processed, FAIL
-- **T5** insufficient free space → refuses to start
-
-`FP_TEST_BIG_MB=200 pytest` makes the large file bigger.
-
-One test (`test_t4b_...`) blocks writes with a read-only folder and is skipped
-when running as root, since root ignores directory permissions. The main T4 test
-blocks writes a way that works for any user.
-
-## Not in this slice
-
-No Resolve integration, no external APIs, no database, and no delete/move/rename
-of anything — by design.
+Then, if you want the native Mac feel, port the UI to SwiftUI — the schema,
+matching logic, and category taxonomy come straight across.
