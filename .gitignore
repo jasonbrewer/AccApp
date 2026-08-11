@@ -4,11 +4,3 @@ ledger_*.sqlite*
 _test.sqlite*
 *.csv
 !sample_statement.csv
-
-# footage-pipeline
-.venv/
-.pytest_cache/
-*.egg-info/
-build/
-dist/
-settings.json
