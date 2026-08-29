@@ -77,6 +77,29 @@ def parse_amount_to_cents(raw):
     return -abs(cents) if neg else cents
 
 
+def split_amount_to_cents(raw_debit, raw_credit):
+    """Fold a Debit/Credit column pair into one signed cents value.
+
+    Money out is negative, money in positive. Taking abs() of each side means a
+    debit written as 5.21 and one written as -41.31 land the same way — banks do
+    both. Returns None when neither side is filled in or a filled side won't
+    parse, which the caller treats as an unreadable row.
+    """
+    d, c = str(raw_debit).strip(), str(raw_credit).strip()
+    if not d and not c:
+        return None
+    debit_cents = credit_cents = 0
+    if d:
+        debit_cents = parse_amount_to_cents(d)
+        if debit_cents is None:
+            return None
+    if c:
+        credit_cents = parse_amount_to_cents(c)
+        if credit_cents is None:
+            return None
+    return abs(credit_cents) - abs(debit_cents)
+
+
 def is_dedup_conflict(err):
     """True only for the dedup_key UNIQUE violation — i.e. an already-imported row.
 
@@ -87,19 +110,61 @@ def is_dedup_conflict(err):
     return "unique constraint failed" in msg and "dedup_key" in msg
 
 
+HEADER_KEYWORDS = (
+    "date", "posted", "posting", "clearing", "description", "desc", "memo",
+    "amount", "amt", "debit", "credit", "balance", "transaction", "merchant",
+    "category", "type", "payee", "withdrawal", "deposit", "check", "fees", "card",
+)
+
+
+def find_header_row(rows):
+    """Index of the row that actually looks like a header.
+
+    Real statements often carry a preamble ("Date Range : ...") above the
+    header, so rows[0] is not a safe assumption. Score each of the first 20
+    rows by how many of its cells look like column names; the best-scoring
+    row that clears the bar wins, ties going to the earliest. If nothing
+    qualifies we return 0 — the old behavior, including its error path.
+    """
+    best_idx, best_score = 0, 0
+    for i, row in enumerate(rows[:20]):
+        cells = [c.strip().lower() for c in row]
+        filled = sum(1 for c in cells if c)
+        score = sum(1 for c in cells if any(k in c for k in HEADER_KEYWORDS))
+        if score >= 2 and filled >= 2 and score > best_score:
+            best_idx, best_score = i, score
+    return best_idx
+
+
 def detect_columns(header):
-    """Map a bank CSV's header row to date / description / amount columns."""
+    """Map a bank CSV's header row to date / description / amount column(s).
+
+    Two shapes exist in the wild: one signed amount column, or a split
+    Debit/Credit pair. The split is decided FIRST — otherwise a header like
+    "Amount Debit,Amount Credit" would be misread as a single amount column
+    and every credit would be lost.
+    """
     lower = [h.strip().lower() for h in header]
-    def find(cands):
+    def find(cands, skip=()):
         for i, h in enumerate(lower):
+            if i in skip:
+                continue
             if any(c in h for c in cands):
                 return i
         return None
-    return {
-        "date": find(["date", "posted", "posting"]),
-        "desc": find(["description", "merchant", "name", "payee", "memo", "details"]),
-        "amount": find(["amount", "debit", "value"]),
-    }
+
+    date = find(["date", "posted", "posting", "clearing"])
+    desc = find(["description", "merchant", "name", "payee", "memo", "details"])
+    debit = find(["debit", "withdrawal", "charge"])
+    credit = find(["credit", "deposit"])
+
+    if debit is not None and credit is not None and debit != credit:
+        return {"date": date, "desc": desc, "mode": "debitcredit",
+                "debit": debit, "credit": credit, "amount": None}
+
+    amount = find(["amount", "amt", "value"], skip={date, desc})
+    return {"date": date, "desc": desc, "mode": "single",
+            "amount": amount, "debit": None, "credit": None}
 
 
 def txn_use(row):
@@ -272,9 +337,15 @@ def do_import():
         if not rows:
             return page("<div class=empty>That file looked empty.</div>", "import")
 
-        header, data = rows[0], rows[1:]
+        # Preamble lines above the real header ("Date Range : ...") are discarded,
+        # not counted as unreadable rows.
+        h = find_header_row(rows)
+        header, data = rows[h], rows[h + 1:]
         cols = detect_columns(header)
-        if cols["date"] is None or cols["desc"] is None or cols["amount"] is None:
+        if cols["date"] is None or cols["desc"] is None or (
+            cols["amount"] is None if cols["mode"] == "single"
+            else cols["debit"] is None or cols["credit"] is None
+        ):
             return page(
                 "<div class=empty>Couldn't find date / description / amount columns "
                 "in that file's header. (Column-mapping UI is a next step.)</div>", "import")
@@ -299,7 +370,11 @@ def do_import():
             try:
                 raw_date = row[cols["date"]].strip()
                 desc = row[cols["desc"]].strip()
-                cents = parse_amount_to_cents(row[cols["amount"]])
+                if cols["mode"] == "single":
+                    cents = parse_amount_to_cents(row[cols["amount"]])
+                else:
+                    cents = split_amount_to_cents(
+                        row[cols["debit"]], row[cols["credit"]])
             except IndexError:
                 skipped += 1
                 continue
