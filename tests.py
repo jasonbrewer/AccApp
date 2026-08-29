@@ -219,5 +219,86 @@ counted == sum(-r["amount_cents"] for r in rows) or fail(
     "some spending is not counted in the dashboard's business/personal totals")
 client.get("/").status_code == 200 or fail("dashboard errored after the bogus-use write")
 
+
+# ---------------------------------------------------------------------------
+# Header detection + Debit/Credit columns. Synthetic data only.
+# ---------------------------------------------------------------------------
+
+BAD_HEADER = b"Couldn't find date / description / amount columns"
+# proves the constant above matches a real rejection, so the "not in" asserts below
+# are meaningful rather than vacuous
+BAD_HEADER in import_csv("Alpha,Beta\n1,2\n", "nohdr.csv").data or fail(
+    "a file with no recognizable header must still hit the detection-failed page")
+
+
+def cents_of(desc):
+    row = conn.execute(
+        "SELECT amount_cents FROM transactions WHERE description=?", (desc,)).fetchone()
+    return row and row["amount_cents"]
+
+
+# 15. a preamble line above the header is found, skipped, and not "unreadable"
+r = import_csv(
+    "Date Range : 01/01/2026-03/31/2026\n"
+    "Transaction Number,Date,Description,Memo,Amount Debit,Amount Credit,"
+    "Balance,Check Number,Fees\n"
+    "9001,02/10/2026,PREAMBLE HARDWARE CO,,-41.31,,1000.00,,\n", "preamble.csv")
+BAD_HEADER not in r.data or fail("a file with a preamble line should still detect columns")
+b"Imported 1 new" in r.data or fail("the row below a preamble header should import")
+b"rows unreadable" not in r.data or fail("the preamble line must not count as unreadable")
+cents_of("PREAMBLE HARDWARE CO") == -4131 or fail(
+    f"preamble file debit stored as {cents_of('PREAMBLE HARDWARE CO')}, expected -4131")
+
+# 16. Debit/Credit split with a POSITIVE debit column
+r = import_csv(
+    "Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit\n"
+    "02/11/2026,02/12/2026,1234,POSITIVE DEBIT CAFE,Meals,5.21,\n"
+    "02/12/2026,02/13/2026,1234,POSITIVE CREDIT REFUND,Meals,,10.00\n", "poscc.csv")
+BAD_HEADER not in r.data or fail("Debit/Credit header should be detected, not rejected")
+b"Imported 2 new" in r.data or fail("both split-column rows should import")
+cents_of("POSITIVE DEBIT CAFE") == -521 or fail(
+    f"debit 5.21 stored as {cents_of('POSITIVE DEBIT CAFE')}, expected -521")
+cents_of("POSITIVE CREDIT REFUND") == 1000 or fail(
+    f"credit 10.00 stored as {cents_of('POSITIVE CREDIT REFUND')}, expected 1000")
+
+# 17. Debit/Credit split where the debit is ALREADY negative — never double-negated
+r = import_csv(
+    "Date,No.,Description,Debit,Credit\n"
+    "02/13/2026,7,NEGATIVE DEBIT SUPPLY,-41.31,\n"
+    "02/14/2026,8,NEGATIVE CREDIT PAYOUT,,1400\n", "negcc.csv")
+BAD_HEADER not in r.data or fail("short Debit/Credit header should be detected")
+b"Imported 2 new" in r.data or fail("both negative-debit rows should import")
+cents_of("NEGATIVE DEBIT SUPPLY") == -4131 or fail(
+    f"debit -41.31 stored as {cents_of('NEGATIVE DEBIT SUPPLY')}, expected -4131")
+cents_of("NEGATIVE CREDIT PAYOUT") == 140000 or fail(
+    f"credit 1400 stored as {cents_of('NEGATIVE CREDIT PAYOUT')}, expected 140000")
+
+# 18. the single signed-amount path is unchanged
+r = import_csv(
+    "Transaction Date,Clearing Date,Description,Merchant,Category,Type,"
+    "Amount (USD),Purchased By\n"
+    "02/15/2026,02/16/2026,SINGLE AMOUNT STUDIO,SINGLE AMOUNT STUDIO,Equipment,"
+    "Sale,-327.71,J. Brewer\n", "single.csv")
+BAD_HEADER not in r.data or fail("single-amount header should still be detected")
+b"Imported 1 new" in r.data or fail("the single-amount row should import")
+cents_of("SINGLE AMOUNT STUDIO") == -32771 or fail(
+    f"single amount -327.71 stored as {cents_of('SINGLE AMOUNT STUDIO')}, expected -32771")
+
+# 19. detection precedence, unit level
+d = A.detect_columns(["Transaction Number", "Date", "Description", "Memo",
+                      "Amount Debit", "Amount Credit", "Balance"])
+(d["mode"], d["date"], d["desc"], d["debit"], d["credit"]) == ("debitcredit", 1, 2, 4, 5) or fail(
+    f"'Amount Debit'/'Amount Credit' must map to the split path, got {d}")
+d = A.detect_columns(["Date", "Description", "Amount"])
+(d["mode"], d["date"], d["desc"], d["amount"]) == ("single", 0, 1, 2) or fail(
+    f"the plain three-column shape must stay on the single path, got {d}")
+A.find_header_row([["Date Range : 01/01/2026-03/31/2026"],
+                   ["Date", "Description", "Amount"]]) == 1 or fail(
+    "find_header_row should skip a single-cell preamble line")
+A.find_header_row([["Date", "Description", "Amount"], ["a", "b", "c"]]) == 0 or fail(
+    "find_header_row should pick row 0 when it is the header")
+A.find_header_row([["nothing", "here"], ["still", "nothing"]]) == 0 or fail(
+    "find_header_row must fall back to 0 so the existing error path is preserved")
+
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")
