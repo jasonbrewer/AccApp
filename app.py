@@ -20,6 +20,7 @@ import csv
 import html
 import io
 import os
+import secrets
 import sqlite3
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -165,6 +166,100 @@ def detect_columns(header):
     amount = find(["amount", "amt", "value"], skip={date, desc})
     return {"date": date, "desc": desc, "mode": "single",
             "amount": amount, "debit": None, "credit": None}
+
+
+# Phase-1 uploads waiting for the user to confirm their column mapping, keyed by
+# a random token. Deliberately in memory and nowhere near the schema: a parked
+# upload is not ledger data, and a half-finished import should not survive a
+# restart. If the process restarts (or the user sits on the page past the cap
+# below), the token goes stale and phase 2 says so instead of crashing. Fine for
+# a local single-user app; it would not be for a shared server.
+PENDING_IMPORTS = {}
+MAX_PENDING = 8
+PREVIEW_ROWS = 5
+
+# The two ways a bank writes spending in a single signed column.
+SIGN_CHOICES = (("negative", "Negative numbers"), ("positive", "Positive numbers"))
+
+
+def stash_import(account_id, filename, header, data, preamble, detected):
+    """Park a parsed upload for phase 2 and return its token."""
+    while len(PENDING_IMPORTS) >= MAX_PENDING:
+        PENDING_IMPORTS.pop(next(iter(PENDING_IMPORTS)))     # oldest first
+    token = secrets.token_urlsafe(16)
+    PENDING_IMPORTS[token] = {
+        "account_id": account_id, "filename": filename, "header": header,
+        "data": data, "preamble": preamble, "detected": detected,
+    }
+    return token
+
+
+def form_column(field, ncols):
+    """A column index the user picked, or None if absent/unusable."""
+    raw = request.form.get(field)
+    if raw is None or raw == "":
+        return None
+    try:
+        i = int(raw)
+    except ValueError:
+        return None
+    return i if 0 <= i < ncols else None
+
+
+def effective_mapping(detected, ncols):
+    """The mapping to read the file with: what was submitted, else what was detected.
+
+    Every field falls back independently, so a commit carrying only a token
+    imports under pure auto-detect — which is exactly what today's behavior is.
+    """
+    m = dict(detected)
+    mode = request.form.get("mode")
+    if mode in ("single", "debitcredit"):
+        m["mode"] = mode
+    for field, key in (("date_col", "date"), ("desc_col", "desc"),
+                       ("amount_col", "amount"), ("debit_col", "debit"),
+                       ("credit_col", "credit")):
+        picked = form_column(field, ncols)
+        if picked is not None:
+            m[key] = picked
+    sign = request.form.get("sign")
+    m["sign"] = sign if sign in dict(SIGN_CHOICES) else detected.get("sign", "negative")
+    return m
+
+
+def mapping_is_complete(m):
+    return not (m["date"] is None or m["desc"] is None or (
+        m["amount"] is None if m["mode"] == "single"
+        else m["debit"] is None or m["credit"] is None))
+
+
+def read_row(row, m):
+    """One data row under a mapping -> (date, desc, cents), or None if unreadable.
+
+    The skip rules are the ones the importer has always used: a short row, an
+    unparseable date, an empty description or an unparseable amount is skipped.
+    Cents come from the existing parsers — parse_amount_to_cents for a single
+    signed column, split_amount_to_cents for a Debit/Credit pair — never from
+    anything new. The preview and the commit both go through here, so what you
+    see on the mapping page is what gets written.
+    """
+    try:
+        raw_date = row[m["date"]].strip()
+        desc = row[m["desc"]].strip()
+        if m["mode"] == "single":
+            cents = parse_amount_to_cents(row[m["amount"]])
+            # A statement that writes spending as positive numbers is the same
+            # file with every sign flipped; income keeps its own (opposite) sign.
+            if cents is not None and m.get("sign") == "positive":
+                cents = -cents
+        else:
+            cents = split_amount_to_cents(row[m["debit"]], row[m["credit"]])
+    except IndexError:
+        return None
+    date = normalize_date(raw_date)
+    if cents is None or not desc or date is None:
+        return None
+    return date, desc, cents
 
 
 def txn_use(row):
@@ -355,6 +450,9 @@ def do_import():
     accounts = conn.execute("SELECT * FROM accounts ORDER BY name").fetchall()
 
     if request.method == "POST":
+        # ---- phase 1: parse and auto-detect a starting mapping. Nothing is
+        # written here — no import_batches row, no transactions. The parsed file
+        # is parked in memory and the user gets a mapping + preview screen.
         account_id = int(request.form["account_id"])
         f = request.files.get("file")
         if not f or not f.filename:
@@ -371,79 +469,15 @@ def do_import():
         h = find_header_row(rows)
         header, data = rows[h], rows[h + 1:]
         cols = detect_columns(header)
-        if cols["date"] is None or cols["desc"] is None or (
-            cols["amount"] is None if cols["mode"] == "single"
-            else cols["debit"] is None or cols["credit"] is None
-        ):
+        if not mapping_is_complete(cols):
             return page(
                 "<div class=empty>Couldn't find date / description / amount columns "
-                "in that file's header. (Column-mapping UI is a next step.)</div>", "import")
+                "in that file's header, so there's nothing to map yet. "
+                "Check the file and try again.</div>", "import")
 
-        cat_names = db.category_names(conn)
-        cz = Categorizer(conn, cat_names)
-        now = datetime.utcnow().isoformat()
-        cur = conn.execute(
-            "INSERT INTO import_batches(account_id, filename, imported_at) VALUES (?,?,?)",
-            (account_id, f.filename, now))
-        batch_id = cur.lastrowid
-        cat_id = db.category_map(conn)
-
-        added = dups = skipped = 0
-        # Three identical $5 coffees on one day are three purchases, not one.
-        # Counting occurrences of each base key within THIS file and appending
-        # the index keeps them distinct while a re-import of the same file
-        # regenerates #1/#2/#3 identically and still dedups (invariant 7).
-        # This does assume stable row ordering across re-imports of a file.
-        seen = {}
-        for row in data:            # file order — the sequence must be stable
-            try:
-                raw_date = row[cols["date"]].strip()
-                desc = row[cols["desc"]].strip()
-                if cols["mode"] == "single":
-                    cents = parse_amount_to_cents(row[cols["amount"]])
-                else:
-                    cents = split_amount_to_cents(
-                        row[cols["debit"]], row[cols["credit"]])
-            except IndexError:
-                skipped += 1
-                continue
-            date = normalize_date(raw_date)
-            if cents is None or not desc or date is None:
-                skipped += 1
-                continue
-
-            merchant = normalize_merchant(desc)
-            base = f"{account_id}|{date}|{cents}|{desc}"
-            seen[base] = seen.get(base, 0) + 1
-            dedup = f"{base}#{seen[base]}"
-
-            guess = cz.categorize(desc, cents, merchant)
-            cid = cat_id.get(guess["category"], cat_id["Uncategorized"])
-            try:
-                conn.execute(
-                    """INSERT INTO transactions
-                       (account_id, txn_date, description, merchant_norm, amount_cents,
-                        use, category_id, category_source, ai_confidence,
-                        import_batch_id, dedup_key, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (account_id, date, desc, merchant, cents, guess["use"], cid,
-                     guess["source"], guess["confidence"], batch_id, dedup, now))
-                added += 1
-            except sqlite3.IntegrityError as err:
-                if not is_dedup_conflict(err):
-                    raise      # NOT NULL / FK / anything else is a real failure
-                dups += 1      # this exact row of this file is already imported
-
-        conn.execute("UPDATE import_batches SET row_count=?, dup_count=? WHERE id=?",
-                     (added, dups, batch_id))
-        conn.commit()
-
-        note = f"Imported {added} new · {dups} duplicates skipped"
-        if skipped:
-            note += f" · {skipped} rows unreadable"
-        body = f"""<h1>Import complete</h1><p class=sub>{note}.</p>
-          <a class=btn href='{url_for('review')}'>Review new transactions →</a>"""
-        return page(body, "import")
+        cols["sign"] = "negative"      # a signed amount column, read as written
+        token = stash_import(account_id, f.filename, header, data, h, cols)
+        return page(mapping_body(token, PENDING_IMPORTS[token], cols), "import")
 
     opts = "".join(
         f"<option value=\"{a['id']}\">{esc(a['name'])} — {esc(a['default_use'])}</option>"
@@ -481,6 +515,177 @@ def do_import():
         <button class=btn>Import</button>
       </form>
       {recent}"""
+    return page(body, "import")
+
+
+def column_select(name, headers, chosen):
+    """A <select> over the file's own column names."""
+    opts = "".join(
+        f"<option value=\"{i}\" {'selected' if i == chosen else ''}>"
+        f"{esc(h.strip() or f'(column {i + 1})')}</option>"
+        for i, h in enumerate(headers))
+    return f"<select name={name}>{opts}</select>"
+
+
+def mapping_body(token, stash, m):
+    """The mapping + preview screen. Renders, never writes."""
+    headers, data = stash["header"], stash["data"]
+
+    if m["mode"] == "single":
+        signopts = "".join(
+            f"<option value={v} {'selected' if m.get('sign') == v else ''}>{label}</option>"
+            for v, label in SIGN_CHOICES)
+        money_fields = f"""
+          <span><label class=lbl>Amount column</label>
+            {column_select('amount_col', headers, m['amount'])}</span>
+          <span><label class=lbl>Spending shows as</label>
+            <select name=sign>{signopts}</select></span>"""
+    else:
+        money_fields = f"""
+          <span><label class=lbl>Debit column</label>
+            {column_select('debit_col', headers, m['debit'])}</span>
+          <span><label class=lbl>Credit column</label>
+            {column_select('credit_col', headers, m['credit'])}</span>"""
+
+    modes = "".join(
+        f"<label><input type=radio name=mode value={v} "
+        f"{'checked' if m['mode'] == v else ''}><span>{label}</span></label>"
+        for v, label in (("single", "Single signed amount"),
+                         ("debitcredit", "Separate debit / credit")))
+
+    prows = ""
+    for row in data[:PREVIEW_ROWS]:
+        got = read_row(row, m)
+        if got is None:
+            prows += ("<tr><td colspan=3 class=src>row skipped under this mapping "
+                      "— unreadable date, description or amount</td></tr>")
+            continue
+        date, desc, cents = got
+        prows += (f"<tr><td>{esc(date)}</td><td>{esc(desc)}</td>"
+                  f"<td class='r num'>{money(cents)}</td></tr>")
+    if not prows:
+        prows = "<tr><td colspan=3 class=src>no data rows below the header</td></tr>"
+
+    pre = stash["preamble"]
+    prenote = (f"<p class=sub>skipped {pre} preamble row{'' if pre == 1 else 's'} "
+               f"above the header.</p>" if pre else "")
+
+    return f"""
+      <h1>Check the columns</h1>
+      <p class=sub>{esc(stash['filename'])} — nothing has been imported yet.
+         Adjust anything that looks wrong, preview it, then import.</p>
+      {prenote}
+      <form method=post class=rev>
+        <input type=hidden name=token value="{esc(token)}">
+        <input type=hidden name=account_id value="{stash['account_id']}">
+        <div class=field>
+          <span><label class=lbl>Date column</label>
+            {column_select('date_col', headers, m['date'])}</span>
+          <span><label class=lbl>Description column</label>
+            {column_select('desc_col', headers, m['desc'])}</span>
+        </div>
+        <div class=field><label class=lbl>Money style</label>
+          <span class=radio>{modes}</span></div>
+        <div class=field>{money_fields}</div>
+        <h2>Preview</h2>
+        <table><tr><th>Date</th><th>Description</th><th class=r>Amount</th></tr>
+          {prows}</table>
+        <div class=field style='margin-top:16px'>
+          <button class='btn ghost' formaction="{url_for('preview_import')}">Update preview</button>
+          <button class=btn formaction="{url_for('commit_import')}">Import</button>
+        </div>
+      </form>"""
+
+
+EXPIRED = "That upload expired — please choose the file again."
+
+
+@app.route("/import/map", methods=["POST"])
+def preview_import():
+    """Re-render the mapping page under the submitted mapping. Writes nothing."""
+    stash = PENDING_IMPORTS.get(request.form.get("token", ""))
+    if stash is None:
+        return redirect(url_for("do_import", msg=EXPIRED))
+    m = effective_mapping(stash["detected"], len(stash["header"]))
+    return page(mapping_body(request.form["token"], stash, m), "import")
+
+
+@app.route("/import/commit", methods=["POST"])
+def commit_import():
+    """Phase 2: import the parked file under the mapping the user confirmed.
+
+    This is the only route in the flow that writes. Everything below the mapping
+    lookup — dedup_key, merchant_norm, categorization, the INSERT and the
+    import_batches row — is the importer as it has always been; the mapping only
+    decides which cells are read.
+    """
+    token = request.form.get("token", "")
+    stash = PENDING_IMPORTS.get(token)
+    if stash is None:
+        return redirect(url_for("do_import", msg=EXPIRED))
+
+    conn = get_conn()
+    account_id = stash["account_id"]
+    data = stash["data"]
+    cols = effective_mapping(stash["detected"], len(stash["header"]))
+    if not mapping_is_complete(cols):
+        return page(mapping_body(token, stash, cols), "import")
+
+    cat_names = db.category_names(conn)
+    cz = Categorizer(conn, cat_names)
+    now = datetime.utcnow().isoformat()
+    cur = conn.execute(
+        "INSERT INTO import_batches(account_id, filename, imported_at) VALUES (?,?,?)",
+        (account_id, stash["filename"], now))
+    batch_id = cur.lastrowid
+    cat_id = db.category_map(conn)
+
+    added = dups = skipped = 0
+    # Three identical $5 coffees on one day are three purchases, not one.
+    # Counting occurrences of each base key within THIS file and appending
+    # the index keeps them distinct while a re-import of the same file
+    # regenerates #1/#2/#3 identically and still dedups (invariant 7).
+    # This does assume stable row ordering across re-imports of a file.
+    seen = {}
+    for row in data:            # file order — the sequence must be stable
+        got = read_row(row, cols)
+        if got is None:
+            skipped += 1
+            continue
+        date, desc, cents = got
+
+        merchant = normalize_merchant(desc)
+        base = f"{account_id}|{date}|{cents}|{desc}"
+        seen[base] = seen.get(base, 0) + 1
+        dedup = f"{base}#{seen[base]}"
+
+        guess = cz.categorize(desc, cents, merchant)
+        cid = cat_id.get(guess["category"], cat_id["Uncategorized"])
+        try:
+            conn.execute(
+                """INSERT INTO transactions
+                   (account_id, txn_date, description, merchant_norm, amount_cents,
+                    use, category_id, category_source, ai_confidence,
+                    import_batch_id, dedup_key, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (account_id, date, desc, merchant, cents, guess["use"], cid,
+                 guess["source"], guess["confidence"], batch_id, dedup, now))
+            added += 1
+        except sqlite3.IntegrityError as err:
+            if not is_dedup_conflict(err):
+                raise      # NOT NULL / FK / anything else is a real failure
+            dups += 1      # this exact row of this file is already imported
+
+    conn.execute("UPDATE import_batches SET row_count=?, dup_count=? WHERE id=?",
+                 (added, dups, batch_id))
+    conn.commit()
+    PENDING_IMPORTS.pop(token, None)
+
+    note = f"Imported {added} new · {dups} duplicates skipped"
+    if skipped:
+        note += f" · {skipped} rows unreadable"
+    body = f"""<h1>Import complete</h1><p class=sub>{note}.</p>
+      <a class=btn href='{url_for('review')}'>Review new transactions →</a>"""
     return page(body, "import")
 
 
