@@ -57,6 +57,7 @@ bad == 0 or fail("amount_cents must always be integer")
 # 4. rule-first categorization fires deterministically (no Ollama needed)
 ruled = conn.execute("SELECT COUNT(*) n FROM transactions WHERE category_source='rule'").fetchone()["n"]
 ruled >= 8 or fail(f"expected >=8 rule matches from seeds, got {ruled}")
+print(f"seed rule matches on sample_statement.csv: {ruled}")
 
 # 5. review confirms and LEARNS a rule for an unknown merchant
 gh = conn.execute("SELECT id, merchant_norm FROM transactions WHERE description LIKE 'GITHUB%'").fetchone()
@@ -299,6 +300,45 @@ A.find_header_row([["Date", "Description", "Amount"], ["a", "b", "c"]]) == 0 or 
     "find_header_row should pick row 0 when it is the header")
 A.find_header_row([["nothing", "here"], ["still", "nothing"]]) == 0 or fail(
     "find_header_row must fall back to 0 so the existing error path is preserved")
+
+# ---------------------------------------------------------------------------
+# 20. normalize_merchant strips generic boilerplate wherever it appears, so the
+# real merchant surfaces. Synthetic descriptions only — never real statement data.
+# ---------------------------------------------------------------------------
+
+from categorizer import normalize_merchant  # noqa: E402
+
+# Boilerplate + reference numbers + a masked card block sit in FRONT of the
+# merchant; the key must still be the merchant.
+PINNED = [
+    ("MERCHANT PURCHASE TERMINAL 55421356 PMUSA 153020 RICHMOND ATLANTA GA "
+     "XXXXXXXXXXXX1545 05-15-26 12:00 AM", "PMUSA RICHMOND"),
+    ("POS WITHDRAWAL - AMAZON MKTPL*B25S28KZ1 440 TERRY AVE N SEATTLE W "
+     "- CARD ENDING IN 4997", "AMAZON MKTPL"),
+    ("POS PURCHASE HULU 123456", "HULU"),
+    ("POS PURCHASE AMAZON 789", "AMAZON"),
+]
+for desc, want in PINNED:
+    got = normalize_merchant(desc)
+    got == want or fail(f"normalize_merchant({desc[:40]!r}...) => {got!r}, expected {want!r}")
+
+# the seed rule "ADOBE" must keep matching through the leading-prefix lookup
+normalize_merchant("ADOBE *CREATIVE CLD 408-536-6000").startswith("ADOBE") or fail(
+    "an ADOBE description must still normalize to a key starting with ADOBE")
+
+# THE REPORTED BUG: distinct merchants behind the same boilerplate used to
+# collapse onto one key ("MERCHANT TERMINAL"), so teaching one taught all.
+keys = [normalize_merchant("POS PURCHASE HULU 123456"),
+        normalize_merchant("POS PURCHASE AMAZON 789"),
+        normalize_merchant("MERCHANT PURCHASE TERMINAL 55421356 PMUSA 153020 "
+                           "RICHMOND ATLANTA GA XXXXXXXXXXXX1545")]
+len(set(keys)) == 3 or fail(f"boilerplate-led descriptions still collapse: {keys}")
+for k in keys:
+    k not in ("MERCHANT TERMINAL", "MERCHANT PURCHASE") or fail(
+        f"normalize_merchant returned pure boilerplate: {k!r}")
+
+# a description that is nothing but boilerplate still yields a usable key
+normalize_merchant("POS PURCHASE") or fail("normalize_merchant must never return ''")
 
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")

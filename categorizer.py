@@ -22,23 +22,52 @@ import urllib.request
 OLLAMA_URL = "http://localhost:11434"
 DEFAULT_MODEL = "llama3.2"   # change to any model you've pulled, e.g. qwen2.5, mistral
 
-# Noise tokens that clutter bank descriptions and hurt merchant matching.
-_NOISE = re.compile(
-    r"\b(POS|PURCHASE|DEBIT|CARD|PAYMENT|VISA|SQ|TST|CKCD|ACH|WEB|ID|XXXX+|#\w+)\b",
-    re.I,
-)
+# Generic bank / processor vocabulary. These words wrap the real merchant on
+# almost every statement ("MERCHANT PURCHASE TERMINAL 55421356 PMUSA ..."), so
+# they must never become the matching key themselves — otherwise every such
+# transaction collapses onto one key and teaching one mis-teaches all of them.
+# Merchant names never go in here.
+BOILERPLATE = {
+    "POS", "PURCHASE", "WITHDRAWAL", "DEPOSIT", "MERCHANT", "TERMINAL", "ACH",
+    "DEBIT", "CREDIT", "CARD", "PAYMENT", "PMT", "RECURRING", "PREAUTH",
+    "PREAUTHORIZED", "PENDING", "AUTH", "EFT", "WEB", "PPD", "DES", "INDN",
+    "TEL", "REF", "TRACE", "VISA", "MC", "SQ", "TST", "CKCD",
+}
+
+_SEPARATORS = re.compile(r"[^A-Z0-9& ]")     # *, ., /, - ... all become spaces
+_MASKED_CARD = re.compile(r"^X+[0-9]*$")     # XXXXXXXX, XXXX1545
+_WORD = re.compile(r"^[A-Z&]+$")             # letters (and &) only
+
+
+def _is_noise(token: str) -> bool:
+    """Boilerplate word, reference/terminal number, or a masked card block."""
+    return (
+        token in BOILERPLATE
+        or sum(c.isdigit() for c in token) >= 2     # 55421356, B25S28KZ1, 00483
+        or bool(_MASKED_CARD.match(token))
+    )
 
 
 def normalize_merchant(description: str) -> str:
-    """Turn 'SQ *CIRCLE K #482 0834' into a stable-ish 'CIRCLE K' matching key."""
-    s = description.upper()
-    s = re.sub(r"[*]", " ", s)
-    s = _NOISE.sub(" ", s)
-    s = re.sub(r"\d{2,}", " ", s)          # drop store / txn numbers
-    s = re.sub(r"[^A-Z& ]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    # keep it short — first two words are usually the merchant
-    return " ".join(s.split()[:2]) or description.upper().strip()
+    """Turn a bank description into a stable-ish merchant matching key.
+
+    Noise is stripped wherever it appears — not just at the front — so the real
+    merchant surfaces before the key is taken:
+
+        'SQ *CIRCLE K #482 0834'                        -> 'CIRCLE WEST'
+        'MERCHANT PURCHASE TERMINAL 554213 PMUSA ...'   -> 'PMUSA RICHMOND'
+
+    Still only two words: precise enough not to over-match, which is what the
+    rule lookup (exact OR leading-prefix, longest wins) expects.
+    """
+    tokens = _SEPARATORS.sub(" ", description.upper()).split()
+    content = [t for t in tokens
+               if not _is_noise(t) and len(t) >= 2 and _WORD.match(t)]
+    key = " ".join(content[:2])
+    if key:
+        return key
+    # All boilerplate and numbers (e.g. 'POS PURCHASE'): never return "".
+    return " ".join(description.upper().split()[:2]) or description.upper().strip()
 
 
 def ollama_available(timeout=1.5) -> bool:
