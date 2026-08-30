@@ -320,6 +320,7 @@ BASE = """
   th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px}
   th{color:var(--muted);font-weight:600;background:#faf9f5} tr:last-child td{border-bottom:0}
   td.r,th.r{text-align:right}
+  th a{color:inherit;text-decoration:none} th a:hover{text-decoration:underline}
   .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
   .pill.settled{background:#e7f2ec;color:var(--settled)}
   .pill.review{background:#fbf1dd;color:var(--review)}
@@ -1050,15 +1051,50 @@ def categorize():
     return page(body, "cat")
 
 
+# Sorting is server-side and whitelisted: the query string picks a key, never
+# a fragment of SQL. Anything unrecognized falls back to SORT_DEFAULT.
+SORT_COLUMNS = {
+    "date": "t.txn_date",
+    "desc": "t.description",
+    "cat": "COALESCE(c.name,'Uncategorized')",
+    "amount": "t.amount_cents",
+}
+SORT_DIRS = {"asc": "ASC", "desc": "DESC"}
+SORT_DEFAULT = ("date", "DESC")
+
+
+def parse_sort(args):
+    """(key, 'ASC'|'DESC') from the query string — both sides whitelisted."""
+    key = args.get("sort", "")
+    direction = SORT_DIRS.get(args.get("dir", "").lower(), "")
+    if key not in SORT_COLUMNS or not direction:
+        return SORT_DEFAULT
+    return key, direction
+
+
+def sort_header(label, key, default_dir, sort, direction, cls=""):
+    """A clickable <th>: flips the active column, else opens on default_dir."""
+    if key == sort:
+        nxt = "asc" if direction == "DESC" else "desc"
+        label += " ▲" if direction == "ASC" else " ▼"
+    else:
+        nxt = default_dir
+    href = f"{url_for('transactions')}?sort={key}&amp;dir={nxt}"
+    return f"<th{cls}><a href='{href}'>{label}</a></th>"
+
+
 @app.route("/transactions")
 def transactions():
     conn = get_conn()
+    sort, direction = parse_sort(request.args)
+    # Both halves come from the whitelists above; t.id keeps the order stable.
+    order = f"ORDER BY {SORT_COLUMNS[sort]} {direction}, t.id DESC"
     rows = conn.execute(
-        """SELECT t.*, a.name acct, a.default_use, c.name catname
+        f"""SELECT t.*, a.name acct, a.default_use, c.name catname
              FROM transactions t
              JOIN accounts a ON a.id=t.account_id
              LEFT JOIN categories c ON c.id=t.category_id
-            ORDER BY t.txn_date DESC, t.id DESC"""
+            {order}"""
     ).fetchall()
     if not rows:
         return page("<h1>Transactions</h1><div class=empty>No transactions yet.</div>", "txns")
@@ -1071,15 +1107,27 @@ def transactions():
                  else "<span class='pill review'>Needs review</span>")
         note = (f"<div class=meta style='color:var(--muted);font-size:12px'>{esc(t['note'])}</div>"
                 if t["note"] else "")
+        # One signed amount_cents, shown in two columns. Display only — storage
+        # is unchanged, and the debit keeps its minus sign.
+        cents = t["amount_cents"]
+        debit = money(cents) if cents < 0 else ""
+        credit = money(cents) if cents > 0 else ""
         trs += (f"<tr><td>{esc(t['txn_date'])}</td>"
                 f"<td>{esc(t['description'])}{note}</td>"
                 f"<td>{esc(t['catname'] or 'Uncategorized')}</td>"
                 f"<td>{upill}</td><td>{state}</td>"
-                f"<td class='r num'>{money(t['amount_cents'])}</td></tr>")
+                f"<td class='r num'>{debit}</td>"
+                f"<td class='r num'>{credit}</td></tr>")
+    # Debit opens on asc (biggest money out on top), Credit on desc (biggest in).
+    heads = (sort_header("Date", "date", "desc", sort, direction)
+             + sort_header("Description", "desc", "asc", sort, direction)
+             + sort_header("Category", "cat", "asc", sort, direction)
+             + "<th>Use</th><th>Status</th>"
+             + sort_header("Debit", "amount", "asc", sort, direction, cls=" class=r")
+             + sort_header("Credit", "amount", "desc", sort, direction, cls=" class=r"))
     body = f"""<h1>Transactions</h1>
       <p class=sub>{len(rows)} transactions in {YEAR}.</p>
-      <table><tr><th>Date</th><th>Description</th><th>Category</th>
-        <th>Use</th><th>Status</th><th class=r>Amount</th></tr>{trs}</table>"""
+      <table><tr>{heads}</tr>{trs}</table>"""
     return page(body, "txns")
 
 
