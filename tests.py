@@ -36,10 +36,40 @@ r.status_code == 200 or fail("dashboard did not load")
 b"Import a statement" in r.data or fail("empty dashboard missing import prompt")
 
 # 2. import sample; then re-import -> all duplicates
+
+# Import is two-phase: POST /import parses and shows a mapping page (writing
+# nothing), and POST /import/commit writes. These helpers drive both phases so
+# every test below still reads as one import.
+TOKEN_RE = re.compile(rb'name=token value="([^"]+)"')
+
+
+def commit_mapping(phase1, account_id="1", **mapping):
+    """Phase 2: take the token off the mapping page and commit under `mapping`.
+
+    With no mapping fields this commits under the auto-detected mapping — what
+    the one-shot importer did — so existing assertions are unchanged.
+    """
+    found = TOKEN_RE.search(phase1.data)
+    if not found:
+        return phase1        # phase 1 rejected the file; that IS the response
+    data = {"token": found.group(1).decode(), "account_id": account_id}
+    data.update(mapping)
+    return client.post("/import/commit", data=data)
+
+
+def upload_csv(text, name="x.csv", account_id="1"):
+    """Phase 1 only: post an in-memory CSV and get the mapping page back."""
+    return client.post(
+        "/import",
+        data={"account_id": account_id, "file": (io.BytesIO(text.encode()), name)},
+        content_type="multipart/form-data")
+
+
 def import_sample():
     with open("sample_statement.csv", "rb") as f:
-        return client.post("/import", data={"account_id": "1", "file": (f, "s.csv")},
-                           content_type="multipart/form-data")
+        r = client.post("/import", data={"account_id": "1", "file": (f, "s.csv")},
+                        content_type="multipart/form-data")
+    return commit_mapping(r)
 
 r = import_sample()
 b"Imported 20 new" in r.data or fail("first import should add 20 rows")
@@ -86,12 +116,9 @@ for raw, want in [("$1,234.56", 123456), ("(12.34)", -1234), ("-47.31", -4731), 
 # Regression tests — one per fix in the import-safety / escaping batch.
 # ---------------------------------------------------------------------------
 
-def import_csv(text, name="x.csv", account_id="1"):
-    """Post an in-memory CSV through the real import route."""
-    return client.post(
-        "/import",
-        data={"account_id": account_id, "file": (io.BytesIO(text.encode()), name)},
-        content_type="multipart/form-data")
+def import_csv(text, name="x.csv", account_id="1", **mapping):
+    """Post an in-memory CSV through the real (two-phase) import route."""
+    return commit_mapping(upload_csv(text, name, account_id), account_id, **mapping)
 
 
 # 8. money() is integer math (invariant 1) and formats exactly as before
@@ -461,6 +488,125 @@ b"<script>alert" not in undo(bid_x).data or fail(
     "raw markup from a filename reached the confirm page")
 b"<script>alert" not in undo(bid_x, confirm=True).data or fail(
     "raw markup from a filename reached the removal message")
+
+# ---------------------------------------------------------------------------
+# 22. Two-phase import with an explicit column mapping. Phase 1 and the preview
+# round-trip must never write; only /import/commit does. Synthetic files only.
+# ---------------------------------------------------------------------------
+
+def ledger_size():
+    """(transactions, import_batches) — what a write would move."""
+    return (conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"],
+            conn.execute("SELECT COUNT(*) n FROM import_batches").fetchone()["n"])
+
+
+def cents_list(like):
+    return [r["amount_cents"] for r in conn.execute(
+        "SELECT amount_cents FROM transactions WHERE description LIKE ? ORDER BY id",
+        (like,))]
+
+
+PLAIN = ("Date,Description,Amount\n"
+         "05/01/2026,MAPPING PHASE ONE CO,-10.00\n"
+         "05/02/2026,MAPPING PHASE ONE INC,-20.00\n")
+
+# 22A. phase 1 renders the mapping page and writes nothing
+before = ledger_size()
+r = upload_csv(PLAIN, "phase1.csv")
+b"name=date_col" in r.data or fail("the mapping page needs a Date column select")
+b"name=desc_col" in r.data or fail("the mapping page needs a Description column select")
+b"name=amount_col" in r.data or fail("a single-amount file needs an Amount column select")
+b"name=sign" in r.data or fail("a single-amount file needs a spending-sign select")
+b"name=mode" in r.data or fail("the mapping page needs the money-style radios")
+b"Update preview" in r.data or fail("the mapping page needs an Update preview button")
+b"Preview" in r.data or fail("the mapping page needs a preview table")
+b"MAPPING PHASE ONE CO" in r.data or fail("the preview should show the first data rows")
+b"-$10.00" in r.data or fail("the preview should show money under the current mapping")
+b"Imported" not in r.data or fail("phase 1 must not report an import")
+ledger_size() == before or fail(f"phase 1 wrote to the ledger: {ledger_size()} != {before}")
+
+# 22F. Update preview re-renders under the submitted mapping and still writes nothing
+token = TOKEN_RE.search(r.data).group(1).decode()
+r2 = client.post("/import/map", data={"token": token, "account_id": "1",
+                                      "date_col": "0", "desc_col": "1",
+                                      "mode": "single", "amount_col": "2",
+                                      "sign": "negative"})
+b"Preview" in r2.data or fail("/import/map should re-render the mapping page")
+b"MAPPING PHASE ONE CO" in r2.data or fail("the re-rendered preview should show rows")
+b"Imported" not in r2.data or fail("/import/map must not report an import")
+ledger_size() == before or fail(f"/import/map wrote to the ledger: {ledger_size()}")
+
+# 22B. THE CORE WIN: re-point Description at a Memo column. Auto-detect picks the
+# literal "Description" column, which every row fills with the same boilerplate;
+# the real merchant is in Memo. A preamble line sits above the header.
+MEMO = ("Statement period : 05/01/2026-05/31/2026\n"
+        "Date,Description,Memo,Amount\n"
+        "05/03/2026,POS PURCHASE,FAKEMART 1120 SPRINGFIELD,-12.34\n"
+        "05/04/2026,POS PURCHASE,FAKECOFFEE 88 DOWNTOWN,-4.56\n")
+
+r = upload_csv(MEMO, "memo.csv")
+b"skipped 1 preamble row" in r.data or fail(
+    "the mapping page should note the skipped preamble row")
+b"POS PURCHASE" in r.data or fail(
+    "the preview should show what auto-detect picked, boilerplate and all")
+
+# commit with Description explicitly re-pointed at the Memo column (index 2)
+r = commit_mapping(r, desc_col="2")
+b"Imported 2 new" in r.data or fail("both memo rows should import")
+stored = [row["description"] for row in conn.execute(
+    "SELECT description FROM transactions WHERE description LIKE 'FAKE%' ORDER BY id")]
+len(stored) == 2 or fail(f"expected 2 rows stored from the Memo column, got {stored}")
+"FAKEMART" in stored[0] or fail(f"stored description is {stored[0]!r}, expected the Memo text")
+conn.execute("SELECT COUNT(*) n FROM transactions WHERE description='POS PURCHASE'"
+             ).fetchone()["n"] == 0 or fail(
+    "the boilerplate Description column was stored instead of the mapped Memo column")
+
+# 22C. an explicit debit/credit mapping overrides an auto-detected single column.
+# Auto-detect reads "Amount" (empty on every row); the user points the import at
+# the Out / In pair instead.
+SPLIT = ("Date,Description,Amount,Out,In\n"
+         "06/01/2026,FAKE HARDWARE MAPPED,,5.21,\n"
+         "06/02/2026,FAKE LUMBER MAPPED,,-41.31,\n"
+         "06/03/2026,FAKE REFUND MAPPED,,,10.00\n")
+r = import_csv(SPLIT, "split.csv", mode="debitcredit", debit_col="3", credit_col="4")
+b"Imported 3 new" in r.data or fail(
+    f"all three split rows should import under the explicit mapping: {r.data[:200]}")
+cents_list("FAKE HARDWARE MAPPED") == [-521] or fail(
+    f"positive debit 5.21 stored as {cents_list('FAKE HARDWARE MAPPED')}, expected [-521]")
+cents_list("FAKE LUMBER MAPPED") == [-4131] or fail(
+    f"negative debit -41.31 stored as {cents_list('FAKE LUMBER MAPPED')}, expected [-4131]")
+cents_list("FAKE REFUND MAPPED") == [1000] or fail(
+    f"credit 10.00 stored as {cents_list('FAKE REFUND MAPPED')}, expected [1000]")
+
+# 22D. single column where the bank writes spending as POSITIVE numbers
+POSSPEND = ("Date,Description,Amount\n"
+            "07/01/2026,FAKE POSITIVE GROCER,42.50\n"
+            "07/02/2026,FAKE POSITIVE REFUND,-15.00\n")
+r = import_csv(POSSPEND, "possign.csv", sign="positive")
+b"Imported 2 new" in r.data or fail("both positive-spending rows should import")
+cents_list("FAKE POSITIVE GROCER") == [-4250] or fail(
+    f"positive spending 42.50 stored as {cents_list('FAKE POSITIVE GROCER')}, expected [-4250]")
+cents_list("FAKE POSITIVE REFUND") == [1500] or fail(
+    f"the money-in row stored as {cents_list('FAKE POSITIVE REFUND')}, expected [1500]")
+
+# ...and the same file under the default sign is the untouched signed column
+r = import_csv(POSSPEND, "possign2.csv")
+cents_list("FAKE POSITIVE GROCER") == [-4250, 4250] or fail(
+    f"the default sign should store 42.50 as +4250, got {cents_list('FAKE POSITIVE GROCER')}")
+
+# 22E. a stash that is gone (server restarted, or the page sat too long)
+before = ledger_size()
+r = client.post("/import/commit", data={"token": "no-such-token", "account_id": "1"},
+                follow_redirects=True)
+r.status_code == 200 or fail("an expired token must not crash the commit route")
+b"That upload expired" in r.data or fail(
+    "an expired token should say so instead of failing silently")
+ledger_size() == before or fail(f"an expired commit wrote to the ledger: {ledger_size()}")
+
+# ...and so must the preview round-trip
+r = client.post("/import/map", data={"token": "no-such-token"}, follow_redirects=True)
+b"That upload expired" in r.data or fail("/import/map should report an expired token too")
+ledger_size() == before or fail("an expired preview wrote to the ledger")
 
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")
