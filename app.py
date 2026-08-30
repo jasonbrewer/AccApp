@@ -262,6 +262,22 @@ def read_row(row, m):
     return date, desc, cents
 
 
+def teach_merchant_rule(conn, merchant_norm, category_id, use):
+    """Learn merchant -> category/use so the next import is rule-matched.
+
+    The single statement that writes merchant_rules. /review's confirm and the
+    grouped categorize screen both come through here, so the learning loop can
+    never drift into two subtly different upserts.
+    """
+    conn.execute(
+        """INSERT INTO merchant_rules(merchant_norm, category_id, use, updated_at)
+           VALUES (?,?,?,?)
+           ON CONFLICT(merchant_norm) DO UPDATE SET
+             category_id=excluded.category_id, use=excluded.use,
+             hits=hits+1, updated_at=excluded.updated_at""",
+        (merchant_norm, category_id, use, datetime.utcnow().isoformat()))
+
+
 def txn_use(row):
     """Effective business/personal for a txn: its own override, else account default."""
     return row["use"] or row["default_use"]
@@ -340,6 +356,7 @@ BASE = """
     <a href="{{ url_for('dashboard') }}" class="{{ 'on' if page=='dash' }}">Dashboard</a>
     <a href="{{ url_for('do_import') }}" class="{{ 'on' if page=='import' }}">Import</a>
     <a href="{{ url_for('review') }}" class="{{ 'on' if page=='review' }}">Review{% if need %} · {{ need }}{% endif %}</a>
+    <a href="{{ url_for('categorize') }}" class="{{ 'on' if page=='cat' }}">Categorize</a>
     <a href="{{ url_for('transactions') }}" class="{{ 'on' if page=='txns' }}">Transactions</a>
   </nav>
 </div></header>
@@ -776,13 +793,7 @@ def review():
                 (cid, use, note, tid))
             # learn: this merchant -> this category/use, so next time it's rule-matched
             if catname != "Uncategorized":
-                conn.execute(
-                    """INSERT INTO merchant_rules(merchant_norm, category_id, use, updated_at)
-                       VALUES (?,?,?,?)
-                       ON CONFLICT(merchant_norm) DO UPDATE SET
-                         category_id=excluded.category_id, use=excluded.use,
-                         hits=hits+1, updated_at=excluded.updated_at""",
-                    (row["merchant_norm"], cid, use, datetime.utcnow().isoformat()))
+                teach_merchant_rule(conn, row["merchant_norm"], cid, use)
         conn.commit()
         return redirect(url_for("review"))
 
@@ -841,6 +852,202 @@ def review():
         <button class=btn>Confirm & next two →</button>
       </form>"""
     return page(body, "review")
+
+
+LEAVE = "— leave unchanged —"
+
+
+def cat_select(name, cats):
+    """Category picker that defaults to leaving the row/group alone."""
+    opts = f"<option value=''>{LEAVE}</option>" + "".join(
+        f"<option>{esc(c)}</option>" for c in cats)
+    return f"<select name={name}>{opts}</select>"
+
+
+def use_select(name, current):
+    opts = "".join(
+        f"<option value={u} {'selected' if u == current else ''}>{u.title()}</option>"
+        for u in VALID_USES)
+    return f"<select name={name}>{opts}</select>"
+
+
+def merchant_groups(conn):
+    """Every transaction, bucketed by merchant_norm.
+
+    Groups holding unreviewed rows come first — that is the work — then the
+    biggest merchants, then alphabetical so the page is stable between visits.
+    """
+    rows = conn.execute(
+        """SELECT t.*, a.name acct, a.default_use, c.name catname
+             FROM transactions t
+             JOIN accounts a ON a.id=t.account_id
+             LEFT JOIN categories c ON c.id=t.category_id
+            ORDER BY t.txn_date, t.id"""
+    ).fetchall()
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["merchant_norm"], []).append(r)
+    ordered = sorted(
+        groups.items(),
+        key=lambda kv: (all(r["reviewed"] for r in kv[1]), -len(kv[1]), kv[0]))
+    return rows, ordered
+
+
+def group_default_use(conn, merchant_norm):
+    """The account default shared by a merchant's rows, else plain business."""
+    uses = {r["default_use"] for r in conn.execute(
+        """SELECT DISTINCT a.default_use FROM transactions t
+             JOIN accounts a ON a.id=t.account_id
+            WHERE t.merchant_norm=?""", (merchant_norm,))}
+    if len(uses) == 1:
+        only = uses.pop()
+        if only in VALID_USES:
+            return only
+    return "business"        # ambiguous (or odd) — the safer business default
+
+
+@app.route("/categorize", methods=["GET", "POST"])
+def categorize():
+    """Categorize a whole merchant at once, with per-row exceptions.
+
+    The distinction this screen exists for: a GROUP action says "this is what
+    this merchant is", so it applies to every row of that merchant AND teaches
+    the merchant rule; a PER-ROW override says "this one transaction is an
+    exception", so it changes that row and deliberately leaves merchant_rules
+    alone. That is what lets one Amazon order be business without every future
+    Amazon becoming business.
+
+    Only category_id, use, category_source and reviewed are ever written here
+    (plus merchant_rules, for group actions). Amounts, dates, descriptions and
+    dedup keys are never touched.
+    """
+    conn = get_conn()
+
+    if request.method == "POST":
+        cat_id = db.category_map(conn)
+        uncategorized = cat_id["Uncategorized"]
+        touched, merchants = set(), 0
+
+        # 1) group actions first, so a row override in the same submit wins.
+        indices = sorted(
+            int(k[len("group_norm_"):]) for k in request.form
+            if k.startswith("group_norm_") and k[len("group_norm_"):].isdigit())
+        for i in indices:
+            norm = request.form.get(f"group_norm_{i}")
+            catname = request.form.get(f"group_cat_{i}", "")
+            if not norm or not catname:      # "— leave unchanged —"
+                continue
+            cid = cat_id.get(catname, uncategorized)
+            use = request.form.get(f"group_use_{i}")
+            if use not in VALID_USES:
+                use = group_default_use(conn, norm)
+
+            ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM transactions WHERE merchant_norm=?", (norm,))]
+            if not ids:
+                continue
+            conn.execute(
+                """UPDATE transactions
+                     SET category_id=?, use=?, category_source='user', reviewed=1
+                   WHERE merchant_norm=?""", (cid, use, norm))
+            touched.update(ids)
+            merchants += 1
+            # Same rule as /review: naming a real category teaches it,
+            # Uncategorized teaches nothing.
+            if cid != uncategorized:
+                teach_merchant_rule(conn, norm, cid, use)
+
+        # 2) per-row exceptions. These never write merchant_rules — that is the
+        # whole point of an override.
+        for key in list(request.form):
+            if not key.startswith("row_cat_"):
+                continue
+            raw = key[len("row_cat_"):]
+            if not raw.isdigit():
+                continue
+            catname = request.form.get(key, "")
+            if not catname:
+                continue
+            tid = int(raw)
+            row = conn.execute(
+                """SELECT t.use, a.default_use FROM transactions t
+                     JOIN accounts a ON a.id=t.account_id WHERE t.id=?""",
+                (tid,)).fetchone()
+            if row is None:
+                continue
+            cid = cat_id.get(catname, uncategorized)
+            use = request.form.get(f"row_use_{tid}")
+            if use not in VALID_USES:
+                use = txn_use(row) if txn_use(row) in VALID_USES else "business"
+            conn.execute(
+                """UPDATE transactions
+                     SET category_id=?, use=?, category_source='user', reviewed=1
+                   WHERE id=?""", (cid, use, tid))
+            touched.add(tid)
+
+        conn.commit()
+        return redirect(url_for(
+            "categorize",
+            msg=f"Updated {len(touched)} transactions across {merchants} merchants."))
+
+    rows, ordered = merchant_groups(conn)
+    cats = db.category_names(conn)
+    if not rows:
+        return page("<h1>Categorize</h1><div class=empty>No transactions yet. "
+                    "Import a statement to begin.</div>", "cat")
+
+    need = sum(1 for r in rows if not r["reviewed"])
+    msg = request.args.get("msg", "")
+    note = f"<p class=sub><span class='status off'>{esc(msg)}</span></p>" if msg else ""
+
+    blocks = ""
+    for i, (norm, grows) in enumerate(ordered):
+        total = sum(r["amount_cents"] for r in grows)
+        left = sum(1 for r in grows if not r["reviewed"])
+        trs = ""
+        for t in grows:
+            tid, use = t["id"], txn_use(t)
+            state = ("<span class='pill settled'>Reviewed</span>" if t["reviewed"]
+                     else "<span class='pill review'>Needs review</span>")
+            trs += (
+                f"<tr><td>{esc(t['txn_date'])}</td>"
+                f"<td>{esc(t['description'])}</td>"
+                f"<td class='r num'>{money(t['amount_cents'])}</td>"
+                f"<td>{esc(t['catname'] or 'Uncategorized')} · {esc(use.title())}</td>"
+                f"<td>{state}</td>"
+                f"<td>{cat_select('row_cat_%d' % tid, cats)}</td>"
+                f"<td>{use_select('row_use_%d' % tid, use)}</td></tr>")
+
+        blocks += f"""
+          <div class=rev>
+            <div class=top>
+              <div><div class=desc>{esc(norm)}</div>
+                   <div class=meta>{len(grows)} transaction{'' if len(grows) == 1 else 's'}
+                     · {left} needing review</div></div>
+              <div class='amt num'>{money(total)}</div>
+            </div>
+            <input type=hidden name=group_norm_{i} value="{esc(norm)}">
+            <div class=field>
+              <label class=lbl>This merchant is</label>
+              {cat_select(f'group_cat_{i}', cats)}
+              {use_select(f'group_use_{i}', group_default_use(conn, norm))}
+              <span class=src>applies to all {len(grows)} and teaches the rule</span>
+            </div>
+            <table><tr><th>Date</th><th>Description</th><th class=r>Amount</th>
+              <th>Now</th><th>Status</th><th>Just this row</th><th>Use</th></tr>
+              {trs}</table>
+          </div>"""
+
+    body = f"""
+      <h1>Categorize</h1>
+      <p class=sub>{len(rows)} transactions · {len(ordered)} merchants · {need} needing review.
+         Set a merchant once — it applies to every row and is remembered. Change a single
+         row instead to make it an exception, which is not remembered.</p>
+      {note}
+      <form method=post>{blocks}
+        <button class=btn>Save changes</button>
+      </form>"""
+    return page(body, "cat")
 
 
 @app.route("/transactions")

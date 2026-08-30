@@ -608,5 +608,145 @@ r = client.post("/import/map", data={"token": "no-such-token"}, follow_redirects
 b"That upload expired" in r.data or fail("/import/map should report an expired token too")
 ledger_size() == before or fail("an expired preview wrote to the ledger")
 
+# ---------------------------------------------------------------------------
+# 23. Grouped categorize screen: set a merchant once, or make one row an
+# exception. Synthetic merchants only — never real statement data.
+# ---------------------------------------------------------------------------
+
+GROUP_RE = re.compile(rb'name=group_norm_(\d+) value="([^"]*)"')
+
+
+def group_indices():
+    """merchant_norm -> the group index the page rendered it under."""
+    return {norm.decode(): i.decode()
+            for i, norm in GROUP_RE.findall(client.get("/categorize").data)}
+
+
+def categorize_post(**fields):
+    return client.post("/categorize", data=fields, follow_redirects=True)
+
+
+def group_apply(norm, catname, use="business", **extra):
+    """Post a group action for one merchant, addressed the way the page renders it."""
+    i = group_indices()[norm]
+    fields = {f"group_norm_{i}": norm, f"group_cat_{i}": catname, f"group_use_{i}": use}
+    fields.update(extra)
+    return categorize_post(**fields)
+
+
+def rows_for(norm):
+    return conn.execute(
+        """SELECT t.id, t.use, t.reviewed, t.category_source, c.name cat
+             FROM transactions t LEFT JOIN categories c ON c.id=t.category_id
+            WHERE t.merchant_norm=? ORDER BY t.id""", (norm,)).fetchall()
+
+
+def rule_for(norm):
+    r = conn.execute(
+        """SELECT c.name cat, r.use FROM merchant_rules r
+             JOIN categories c ON c.id=r.category_id
+            WHERE r.merchant_norm=?""", (norm,)).fetchone()
+    return (r["cat"], r["use"]) if r else None
+
+
+def immutables():
+    """The columns this screen must never write."""
+    return [tuple(r) for r in conn.execute(
+        """SELECT id, txn_date, description, amount_cents, dedup_key
+             FROM transactions ORDER BY id""")]
+
+
+CATZ = ("Date,Description,Amount\n"
+        "09/01/2026,ZED SOFTWARE HQ INVOICE ONE,-19.00\n"
+        "09/02/2026,ZED SOFTWARE HQ INVOICE TWO,-19.00\n"
+        "09/03/2026,QUUX SUPPLY DEPOT ORDER A,-31.00\n"
+        "09/04/2026,QUUX SUPPLY DEPOT ORDER B,-32.00\n"
+        "09/05/2026,QUUX SUPPLY DEPOT ORDER C,-33.00\n"
+        "09/06/2026,NULLCO SERVICES RETAINER,-44.00\n"
+        "09/07/2026,FEEBACK CLIENT DEPOSIT,1200.00\n")
+b"Imported 7 new" in import_csv(CATZ, "categorize.csv").data or fail(
+    "the categorize fixture should import 7 rows")
+
+frozen = immutables()
+
+# 23A. the screen groups by merchant and shows every row, income included
+html = client.get("/categorize").data
+for norm in ("ZED SOFTWARE", "QUUX SUPPLY", "NULLCO SERVICES", "FEEBACK CLIENT"):
+    norm.encode() in html or fail(f"/categorize should show a group for {norm}")
+for desc in (b"ZED SOFTWARE HQ INVOICE ONE", b"QUUX SUPPLY DEPOT ORDER C",
+             b"FEEBACK CLIENT DEPOSIT"):
+    desc in html or fail(f"/categorize should list the row {desc!r}")
+b"$1,200.00" in html or fail("an income row should appear with its amount")
+b"leave unchanged" in html or fail("both pickers should default to leaving things alone")
+b"Save changes" in html or fail("the page needs its single submit button")
+len(rows_for("ZED SOFTWARE")) == 2 or fail("ZED SOFTWARE should have 2 rows")
+len(rows_for("QUUX SUPPLY")) == 3 or fail("QUUX SUPPLY should have 3 rows")
+
+# 23B. a group action applies to every row AND teaches the rule
+r = group_apply("ZED SOFTWARE", "Software & Subscriptions", "business")
+b"Updated 2 transactions across 1 merchants." in r.data or fail(
+    "the group action should report what it changed")
+for row in rows_for("ZED SOFTWARE"):
+    (row["cat"], row["use"], row["reviewed"], row["category_source"]) == (
+        "Software & Subscriptions", "business", 1, "user") or fail(
+        f"group action left a row as {tuple(row)}")
+rule_for("ZED SOFTWARE") == ("Software & Subscriptions", "business") or fail(
+    f"the group action should teach the rule, got {rule_for('ZED SOFTWARE')}")
+
+# 23C. Uncategorized updates the rows but teaches nothing — same rule as /review
+rule_for("NULLCO SERVICES") is None or fail("no rule should exist for NULLCO yet")
+group_apply("NULLCO SERVICES", "Uncategorized", "business")
+rows_for("NULLCO SERVICES")[0]["cat"] == "Uncategorized" or fail(
+    "the rows should still be updated for an Uncategorized group action")
+rows_for("NULLCO SERVICES")[0]["reviewed"] == 1 or fail(
+    "an Uncategorized group action should still mark the rows reviewed")
+rule_for("NULLCO SERVICES") is None or fail(
+    "Uncategorized must not teach a merchant rule")
+
+# 23D. THE CORE GUARANTEE: a per-row exception never rewrites the merchant rule
+group_apply("QUUX SUPPLY", "Office Supplies", "business")
+rule_for("QUUX SUPPLY") == ("Office Supplies", "business") or fail(
+    "the group action should have taught Office Supplies")
+odd = rows_for("QUUX SUPPLY")[0]["id"]
+categorize_post(**{f"row_cat_{odd}": "Meals", f"row_use_{odd}": "business"})
+after = {row["id"]: row["cat"] for row in rows_for("QUUX SUPPLY")}
+after[odd] == "Meals" or fail(f"the overridden row is {after[odd]!r}, expected Meals")
+[c for i, c in after.items() if i != odd] == ["Office Supplies"] * 2 or fail(
+    f"an override leaked onto its siblings: {after}")
+rule_for("QUUX SUPPLY") == ("Office Supplies", "business") or fail(
+    f"a per-row override rewrote merchant_rules to {rule_for('QUUX SUPPLY')} "
+    "— it must never touch the learned rule")
+
+# 23E. in ONE submit, the row override wins for its row; the rule follows the group
+group_apply("QUUX SUPPLY", "Shipping", "business",
+            **{f"row_cat_{odd}": "Travel", f"row_use_{odd}": "personal"})
+after = {row["id"]: (row["cat"], row["use"]) for row in rows_for("QUUX SUPPLY")}
+after[odd] == ("Travel", "personal") or fail(
+    f"the same-submit override lost to the group action: {after[odd]}")
+[v for i, v in after.items() if i != odd] == [("Shipping", "business")] * 2 or fail(
+    f"siblings should carry the group action: {after}")
+rule_for("QUUX SUPPLY") == ("Shipping", "business") or fail(
+    f"the rule should follow the group action, got {rule_for('QUUX SUPPLY')}")
+
+# 23F. already-reviewed rows can be re-set — this screen edits, not just fills in
+all(row["reviewed"] for row in rows_for("QUUX SUPPLY")) or fail(
+    "the QUUX rows should all be reviewed by now")
+group_apply("QUUX SUPPLY", "Equipment", "business")
+{row["cat"] for row in rows_for("QUUX SUPPLY")} == {"Equipment"} or fail(
+    "a group action must re-set already-categorized rows, exception included")
+
+# 23G. merchant and description text is escaped
+import_csv("Date,Description,Amount\n"
+           "09/08/2026,<b>BOLDMART</b> SUPPLIES,-7.00\n", "catesc.csv")
+html = client.get("/categorize").data
+b"&lt;b&gt;BOLDMART&lt;/b&gt; SUPPLIES" in html or fail(
+    "a description containing markup must render escaped on /categorize")
+b"<b>BOLDMART</b>" not in html or fail("raw markup reached /categorize")
+
+# ...and nothing this screen touched moved an amount, date, description or dedup key
+now_frozen = {r[0]: r for r in immutables()}
+all(now_frozen[r[0]] == r for r in frozen) or fail(
+    "categorizing changed a column it must never write")
+
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")
