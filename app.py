@@ -259,6 +259,35 @@ def page(body, page="dash", need=0):
     return render_template_string(BASE, body=body, page=page, need=need, year=YEAR)
 
 
+def recent_imports(conn, limit=25):
+    """Import batches, newest first, each with its LIVE transaction count.
+
+    The count is computed here rather than read from import_batches.row_count:
+    row_count is what the import wrote once and can drift from what is actually
+    still attached to the batch.
+    """
+    return conn.execute(
+        """SELECT b.id, b.filename, b.imported_at, a.name AS acct,
+                  (SELECT COUNT(*) FROM transactions t
+                    WHERE t.import_batch_id = b.id) AS live_count
+             FROM import_batches b
+             LEFT JOIN accounts a ON a.id = b.account_id
+            ORDER BY b.id DESC LIMIT ?""",
+        (limit,)).fetchall()
+
+
+def batch_detail(conn, batch_id):
+    """One batch with its live transaction count, or None if it's gone."""
+    return conn.execute(
+        """SELECT b.id, b.filename, b.imported_at, a.name AS acct,
+                  (SELECT COUNT(*) FROM transactions t
+                    WHERE t.import_batch_id = b.id) AS live_count
+             FROM import_batches b
+             LEFT JOIN accounts a ON a.id = b.account_id
+            WHERE b.id = ?""",
+        (batch_id,)).fetchone()
+
+
 # ----------------------------- routes ------------------------------------
 
 @app.route("/")
@@ -419,16 +448,98 @@ def do_import():
     opts = "".join(
         f"<option value=\"{a['id']}\">{esc(a['name'])} — {esc(a['default_use'])}</option>"
         for a in accounts)
+
+    # A note handed back by the undo route. It carries a filename, so it is
+    # escaped like any other CSV-provided value.
+    msg = request.args.get("msg", "")
+    note = f"<p class=sub><span class='status off'>{esc(msg)}</span></p>" if msg else ""
+
+    batches = recent_imports(conn)
+    if batches:
+        rows_html = "".join(
+            f"<tr><td>{esc(b['filename'])}</td><td>{esc(b['acct'] or '—')}</td>"
+            f"<td>{esc(str(b['imported_at'])[:10])}</td>"
+            f"<td class='r num'>{b['live_count']}</td>"
+            f"<td class=r><form method=post action=\"{url_for('undo_import')}\">"
+            f"<input type=hidden name=batch_id value=\"{b['id']}\">"
+            f"<button class='btn ghost'>Undo import</button></form></td></tr>"
+            for b in batches)
+        recent = f"""<h2>Recent imports</h2>
+          <table><tr><th>File</th><th>Account</th><th>Imported</th>
+            <th class=r>Transactions</th><th class=r></th></tr>{rows_html}</table>"""
+    else:
+        recent = "<h2>Recent imports</h2><p class=sub>No imports yet.</p>"
+
     body = f"""
       <h1>Import a statement</h1>
       <p class=sub>Drop in a bank or credit-card CSV. Duplicates are detected automatically,
          and each transaction is categorized before you review it.</p>
+      {note}
       <form class=up method=post enctype=multipart/form-data>
         <div><label class=lbl>Account</label><br><select name=account_id>{opts}</select></div>
         <div><label class=lbl>CSV file</label><br><input type=file name=file accept=.csv></div>
         <button class=btn>Import</button>
-      </form>"""
+      </form>
+      {recent}"""
     return page(body, "import")
+
+
+@app.route("/import/undo", methods=["POST"])
+def undo_import():
+    """Undo one import: its transactions, then the batch row. POST only.
+
+    Two steps on purpose. The first post only *shows* what would go; nothing is
+    deleted until a second post carries confirm=1. There is no GET handler, so a
+    stray link or a crawler can never remove anything.
+
+    Scope is deliberately narrow: an import does not create merchant rules (only
+    /review does), so undoing one must not remove any. Categories, accounts and
+    merchant_rules are left exactly as they were.
+    """
+    conn = get_conn()
+    try:
+        batch_id = int(request.form.get("batch_id", ""))
+    except (TypeError, ValueError):
+        return redirect(url_for("do_import"))
+
+    batch = batch_detail(conn, batch_id)
+    if batch is None:
+        # Already undone — a stale button in another tab, not an error.
+        return redirect(url_for("do_import", msg="That import was already removed."))
+
+    if request.form.get("confirm") != "1":
+        body = f"""
+          <h1>Undo this import?</h1>
+          <p class=sub>The transactions that came in with this file will be deleted.
+             Learned rules, categories and accounts are left alone.</p>
+          <div class=rev>
+            <div class=top>
+              <div><div class=desc>{esc(batch['filename'])}</div>
+                   <div class=meta>{esc(batch['acct'] or '—')} · imported
+                     {esc(str(batch['imported_at'])[:10])}</div></div>
+              <div class='amt num'>{batch['live_count']}</div>
+            </div>
+            <div class=meta>transactions will be removed</div>
+          </div>
+          <form method=post action="{url_for('undo_import')}"
+                style='display:flex;gap:10px;align-items:center'>
+            <input type=hidden name=batch_id value="{batch['id']}">
+            <input type=hidden name=confirm value="1">
+            <button class=btn>Confirm delete</button>
+            <a class='btn ghost' href="{url_for('do_import')}">Cancel</a>
+          </form>"""
+        return page(body, "import")
+
+    # Children first — foreign_keys is ON — and both statements land in the same
+    # transaction, so the rows and their batch go together or not at all.
+    removed = conn.execute(
+        "DELETE FROM transactions WHERE import_batch_id=?", (batch_id,)).rowcount
+    conn.execute("DELETE FROM import_batches WHERE id=?", (batch_id,))
+    conn.commit()
+
+    plural = "" if removed == 1 else "s"
+    return redirect(url_for(
+        "do_import", msg=f"Removed {removed} transaction{plural} from {batch['filename']}."))
 
 
 @app.route("/review", methods=["GET", "POST"])

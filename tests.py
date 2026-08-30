@@ -340,5 +340,127 @@ for k in keys:
 # a description that is nothing but boilerplate still yields a usable key
 normalize_merchant("POS PURCHASE") or fail("normalize_merchant must never return ''")
 
+# ---------------------------------------------------------------------------
+# 21. Undo an import — two-step confirm, and the delete stays inside one batch.
+# Synthetic statements only; never real statement data.
+# ---------------------------------------------------------------------------
+
+def latest_batch_id():
+    return conn.execute(
+        "SELECT id FROM import_batches ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+
+def batch_state(bid):
+    """(transactions still attached to the batch, batch rows with that id)."""
+    return (conn.execute("SELECT COUNT(*) n FROM transactions WHERE import_batch_id=?",
+                         (bid,)).fetchone()["n"],
+            conn.execute("SELECT COUNT(*) n FROM import_batches WHERE id=?",
+                         (bid,)).fetchone()["n"])
+
+
+def undo(bid, confirm=False):
+    data = {"batch_id": str(bid)}
+    if confirm:
+        data["confirm"] = "1"
+    return client.post("/import/undo", data=data, follow_redirects=True)
+
+
+def table_counts():
+    """Everything undo must leave alone."""
+    return tuple(conn.execute(f"SELECT COUNT(*) n FROM {t}").fetchone()["n"]
+                 for t in ("merchant_rules", "categories", "accounts"))
+
+
+UNDO_A = ("Date,Description,Amount\n"
+          "04/01/2026,UNDO ALPHA TOOLS,-11.11\n"
+          "04/02/2026,UNDO ALPHA FREIGHT,-22.22\n"
+          "04/03/2026,UNDO ALPHA CAFE,-33.33\n")
+UNDO_B = ("Date,Description,Amount\n"
+          "04/04/2026,UNDO BETA LUMBER,-44.44\n"
+          "04/05/2026,UNDO BETA PAINT,-55.55\n")
+
+# 20a. an import creates exactly one batch, and its rows point at it
+b"Imported 3 new" in import_csv(UNDO_A, "undo_a.csv").data or fail(
+    "the undo fixture should import 3 new rows")
+bid_a = latest_batch_id()
+batch_state(bid_a) == (3, 1) or fail(
+    f"after import expected 3 transactions and 1 batch row, got {batch_state(bid_a)}")
+
+untouched = table_counts()
+
+# 20b. first post, WITHOUT the confirm flag: a confirmation page, and no delete
+r = undo(bid_a)
+b"Confirm delete" in r.data or fail("the first undo post should render the confirm page")
+b"undo_a.csv" in r.data or fail("the confirm page should name the file being removed")
+batch_state(bid_a) == (3, 1) or fail(
+    f"the unconfirmed undo deleted something: {batch_state(bid_a)}")
+
+# ...and a GET must never delete either
+client.get("/import/undo").status_code == 405 or fail(
+    "GET on the undo route must not be handled at all")
+batch_state(bid_a) == (3, 1) or fail("a GET to the undo route deleted rows")
+
+# 20c. second post WITH confirm=1: the rows and the batch row are both gone
+r = undo(bid_a, confirm=True)
+b"Removed 3 transactions from undo_a.csv." in r.data or fail(
+    "the undo should report what it removed")
+batch_state(bid_a) == (0, 0) or fail(
+    f"after confirming, expected nothing left, got {batch_state(bid_a)}")
+
+# ...and nothing outside transactions/import_batches moved
+table_counts() == untouched or fail(
+    f"undo touched another table: {table_counts()} != {untouched}")
+
+# 20d. undoing again is gentle, not an error; a malformed id is ignored
+b"That import was already removed." in undo(bid_a, confirm=True).data or fail(
+    "undoing an already-removed batch should redirect with a gentle message")
+r = client.post("/import/undo", data={"batch_id": "not-an-int", "confirm": "1"},
+                follow_redirects=True)
+r.status_code == 200 or fail("a malformed batch_id should redirect, not error")
+
+# 20e. isolation: undoing one batch leaves the other completely intact
+import_csv(UNDO_A, "undo_a2.csv")
+bid_a2 = latest_batch_id()
+import_csv(UNDO_B, "undo_b.csv")
+bid_b = latest_batch_id()
+bid_a2 != bid_b or fail("two imports must produce two batches")
+(batch_state(bid_a2), batch_state(bid_b)) == ((3, 1), (2, 1)) or fail(
+    f"expected 3+2 rows across two batches, got {batch_state(bid_a2)} / {batch_state(bid_b)}")
+
+undo(bid_a2, confirm=True)
+batch_state(bid_a2) == (0, 0) or fail("the undone batch should be empty")
+batch_state(bid_b) == (2, 1) or fail(
+    f"undoing one batch disturbed the other: {batch_state(bid_b)}")
+conn.execute("SELECT COUNT(*) n FROM transactions WHERE description LIKE 'UNDO BETA%'"
+             ).fetchone()["n"] == 2 or fail("the other batch's transactions were deleted")
+
+# 20f. re-importing the same file after an undo brings the rows back as NEW —
+# proof the undo really cleared them rather than leaving dedup keys behind
+r = import_csv(UNDO_A, "undo_a2.csv")
+b"Imported 3 new" in r.data or fail(
+    "re-importing after an undo must add rows, not report them as duplicates")
+b"0 duplicates skipped" in r.data or fail("no row should be blocked as a duplicate")
+batch_state(latest_batch_id()) == (3, 1) or fail(
+    "the re-imported rows should be attached to a fresh batch")
+
+# 20g. the Import page lists recent imports with a live count and an undo button
+page_html = client.get("/import").data
+b"Recent imports" in page_html or fail("the import page should list recent imports")
+b"Undo import" in page_html or fail("each listed import needs an undo button")
+b"undo_b.csv" in page_html or fail("the recent-imports list should name the file")
+
+# 20h. a filename is CSV-provided text: escaped on the list, the confirm page,
+# and in the message the redirect carries back
+import_csv(UNDO_B, "<script>alert(1)</script>.csv")
+bid_x = latest_batch_id()
+b"&lt;script&gt;" in client.get("/import").data or fail(
+    "a filename containing markup must render escaped on the import page")
+b"<script>alert" not in client.get("/import").data or fail(
+    "raw markup from a filename reached the import page")
+b"<script>alert" not in undo(bid_x).data or fail(
+    "raw markup from a filename reached the confirm page")
+b"<script>alert" not in undo(bid_x, confirm=True).data or fail(
+    "raw markup from a filename reached the removal message")
+
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")
