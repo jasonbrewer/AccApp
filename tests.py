@@ -748,5 +748,102 @@ now_frozen = {r[0]: r for r in immutables()}
 all(now_frozen[r[0]] == r for r in frozen) or fail(
     "categorizing changed a column it must never write")
 
+# 24. transactions page: Debit / Credit columns and whitelisted sorting
+#
+# Inserted straight into the table (with valid dedup keys) so these assertions
+# are about the page, not about the import flow.
+conn.executemany(
+    """INSERT INTO transactions
+       (account_id, txn_date, description, merchant_norm, amount_cents,
+        dedup_key, created_at)
+       VALUES (?,?,?,?,?,?,?)""",
+    [(1, "2026-06-01", "DEBITSIDE RENT", "DEBITSIDE", -33700,
+      "dc-debit-1", "now"),
+     (1, "2026-06-02", "CREDITSIDE PAYOUT", "CREDITSIDE", 60000,
+      "dc-credit-1", "now")])
+conn.commit()
+
+page_html = client.get("/transactions").data.decode()
+head = page_html[page_html.index("<table>"):page_html.index("</tr>")]
+"Debit" in head and "Credit" in head or fail(
+    "the transactions header should carry Debit and Credit columns")
+">Amount<" not in head or fail("the lone Amount header should be gone")
+
+
+def cells(description):
+    """The two money cells of the row whose description matches."""
+    at = page_html.index(description)
+    row = page_html[at:page_html.index("</tr>", at)]
+    return re.findall(r"<td class='r num'>([^<]*)</td>", row)
+
+
+cells("DEBITSIDE RENT") == ["-$337.00", ""] or fail(
+    f"a negative amount belongs in the debit cell, got {cells('DEBITSIDE RENT')}")
+cells("CREDITSIDE PAYOUT") == ["", "$600.00"] or fail(
+    f"a positive amount belongs in the credit cell, got {cells('CREDITSIDE PAYOUT')}")
+
+
+def rendered_rows(query=""):
+    r = client.get("/transactions" + query)
+    r.status_code == 200 or fail(f"/transactions{query} returned {r.status_code}")
+    body = r.data.decode()
+    body = body[body.index("<table>"):]
+    return re.findall(r"<tr><td>(\d{4}-\d{2}-\d{2})</td><td>(.*?)</td>", body)
+
+
+def rendered_cents(query=""):
+    r = client.get("/transactions" + query)
+    r.status_code == 200 or fail(f"/transactions{query} returned {r.status_code}")
+    body = r.data.decode()
+    out = []
+    for money_cells in re.findall(
+            r"<td class='r num'>([^<]*)</td><td class='r num'>([^<]*)</td>", body):
+        shown = money_cells[0] or money_cells[1]
+        out.append(shown)
+    return out
+
+
+def to_cents(shown):
+    neg = shown.startswith("-")
+    digits = shown.lstrip("-").lstrip("$").replace(",", "").replace(".", "")
+    n = int(digits) if digits else 0
+    return -n if neg else n
+
+
+# 24A. sort=amount&dir=asc orders by the signed cents, most negative first
+asc = [to_cents(s) for s in rendered_cents("?sort=amount&dir=asc")]
+asc == sorted(asc) or fail(f"amount asc is not ascending by signed cents: {asc[:5]}")
+asc[0] == min(asc) or fail("the most negative amount should be on top for amount asc")
+
+desc = [to_cents(s) for s in rendered_cents("?sort=amount&dir=desc")]
+desc == sorted(desc, reverse=True) or fail(
+    f"amount desc is not descending by signed cents: {desc[:5]}")
+
+# 24B. bad input can never reach SQL — it falls back to the date-desc default
+default_order = rendered_rows()
+rendered_rows("?sort=bogus&dir=bogus") == default_order or fail(
+    "an unrecognized sort/dir must fall back to the default ordering")
+rendered_rows("?sort=amount&dir=bogus") == default_order or fail(
+    "an unrecognized dir must fall back to the default ordering")
+rendered_rows("?sort=t.id;DROP TABLE transactions--&dir=asc") == default_order or fail(
+    "an injection attempt must fall back to the default ordering")
+conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"] > 0 or fail(
+    "the transactions table should still be intact")
+
+# 24C. no query params must order exactly as it did before sorting existed
+expected = [(r["txn_date"], r["description"]) for r in conn.execute(
+    "SELECT txn_date, description FROM transactions ORDER BY txn_date DESC, id DESC")]
+[(d, esc_desc.split("<")[0]) for d, esc_desc in default_order] == [
+    (d, A.esc(t).split("<")[0]) for d, t in expected] or fail(
+    "the unsorted transactions page changed its default ordering")
+
+# 24D. the sorted date column round-trips both ways
+dates_asc = [d for d, _ in rendered_rows("?sort=date&dir=asc")]
+dates_asc == sorted(dates_asc) or fail("date asc is not ascending")
+"Date ▲" in client.get("/transactions?sort=date&dir=asc").data.decode() or fail(
+    "the active column should carry an ascending arrow")
+"Date ▼" in client.get("/transactions").data.decode() or fail(
+    "the default page should mark Date as sorted descending")
+
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")
