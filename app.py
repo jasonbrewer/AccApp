@@ -22,6 +22,10 @@ That grid is a deliberate non-teaching corrections surface — editing a row the
 never writes a merchant_rule. Rule learning lives on Categorize (and /review).
 Corrections there never rewrite dedup_key either: it is frozen at import, so a
 re-imported statement still dedups a row whose amount or date you have fixed.
+Multi-select and the bulk actions built on it (set category, set use, delete)
+inherit both rules: they stamp the selected rows and teach nothing, and a bulk
+delete takes each row's dedup_key with it, so re-importing the same statement
+re-adds exactly what was deleted — the same bargain as undoing an import.
 """
 
 import csv
@@ -388,6 +392,18 @@ BASE = """
     background:#fff;color:var(--muted)}
   .seg button.on{background:var(--ink);color:var(--paper)}
   input.bad{border-color:#b4453c;background:#fdf5f4}
+  /* --- transactions grid: multi-select + bulk action bar --- */
+  th.pick,td.pick{width:1px;padding-right:6px}
+  td.pick{cursor:default}
+  tr.picked td{background:#f3f6fb}
+  .bulk{display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:var(--card);
+    border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:0 0 12px}
+  /* the bar is a flex box, so `hidden` needs saying twice to win */
+  .bulk[hidden]{display:none}
+  .bulk .n{font-weight:600;margin-right:4px}
+  .bulk .btn{padding:6px 12px;font-size:13px}
+  .btn.danger{background:#b4453c;color:#fff}
+  .bulk select{padding:6px 9px;font-size:13px}
 </style></head><body>
 <header><div class=bar>
   <div class=brand>LocalLedger <span>· {{ year }}</span></div>
@@ -781,6 +797,116 @@ BASE = """
     amtInput.focus();
   });
 
+  /* ---- multi-select + bulk actions ----------------------------------
+
+     Selection is client-only: it lives in the checkboxes and nowhere else, so
+     it is gone the moment the page reloads. The bulk actions stamp the rows
+     they were handed and teach nothing — the same rule the cell editor above
+     follows. Rule learning stays on Categorize.  */
+  var BULK_URL = "{{ url_for('transactions_bulk') }}";
+  var bar = document.getElementById("bulk-bar");
+  var barCount = document.getElementById("bulk-count");
+  var barCat = document.getElementById("bulk-cat");
+  var selAll = document.getElementById("sel-all");
+  var anchor = -1;          // index of the last plain (non-shift) click
+
+  function pickers() {
+    // Current DOM order, which is the sort order the server rendered — that
+    // is what a shift-click range is expected to mean.
+    return Array.prototype.slice.call(grid.querySelectorAll("input.rowsel"));
+  }
+
+  function picked() {
+    return pickers().filter(function (cb) { return cb.checked; });
+  }
+
+  function syncBar() {
+    var all = pickers(), on = [];
+    all.forEach(function (cb) {
+      var tr = cb.closest("tr");
+      if (tr) tr.classList.toggle("picked", cb.checked);
+      if (cb.checked) on.push(cb);
+    });
+    if (selAll) {
+      selAll.checked = all.length > 0 && on.length === all.length;
+      selAll.indeterminate = on.length > 0 && on.length < all.length;
+    }
+    if (bar) {
+      bar.hidden = on.length === 0;          // 0 selected -> no bar at all
+      if (barCount) barCount.textContent = on.length + " selected";
+    }
+    return on;
+  }
+
+  function pick(cb, range) {
+    var all = pickers(), i = all.indexOf(cb);
+    if (range && anchor >= 0 && anchor < all.length) {
+      // Shift-click fills the span from the anchor to here; the anchor stays
+      // put, so widening and narrowing the range both work.
+      var lo = Math.min(anchor, i), up = Math.max(anchor, i);
+      for (var k = lo; k <= up; k++) all[k].checked = true;
+    } else {
+      anchor = i;                            // a plain click sets the anchor
+    }
+    syncBar();
+  }
+
+  function pickAll(on) {
+    pickers().forEach(function (cb) { cb.checked = on; });
+    anchor = -1;
+    syncBar();
+  }
+
+  function bulkFail() {
+    if (barCount) barCount.textContent = "Not saved — reload the page.";
+  }
+
+  function bulk(action, value, ask) {
+    var on = picked();
+    if (!on.length) return;
+    if (ask && !window.confirm(ask.replace("N", on.length))) return;
+    var body = new URLSearchParams();
+    body.append("action", action);
+    if (value !== null) body.append("value", value);
+    on.forEach(function (cb) {
+      var tr = cb.closest("tr");
+      if (tr) body.append("ids", tr.getAttribute("data-id"));
+    });
+    fetch(BULK_URL, {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: body.toString()
+    }).then(function (r) {
+      return r.ok ? r.json() : null;
+    }).then(function (d) {
+      // Repainting N rows here would only re-derive what the server already
+      // renders — and after a delete there is nothing to repaint. reload()
+      // re-fetches this exact URL, so ?sort= and &dir= survive untouched.
+      if (d && d.ok) { window.location.reload(); } else { bulkFail(); }
+    }).catch(bulkFail);
+  }
+
+  if (bar) {
+    bar.addEventListener("click", function (e) {
+      var b = e.target.closest("button[data-bulk]");
+      if (!b) return;
+      var what = b.getAttribute("data-bulk");
+      if (what === "category") {
+        bulk("category", barCat ? barCat.value : "", null);
+      } else if (what === "business" || what === "personal") {
+        bulk("use", what, null);
+      } else if (what === "delete") {
+        bulk("delete", null, "Delete N transactions? This cannot be undone.");
+      } else if (what === "clear") {
+        pickAll(false);
+      }
+    });
+  }
+
+  // Some browsers restore checkbox state across a reload. Selection is meant
+  // to be gone after one, so the grid starts empty-handed every time.
+  pickAll(false);
+
   /* ---- one delegated listener for the whole grid ---- */
   function edit(cell) {
     var field = cell.getAttribute("data-field");
@@ -797,6 +923,12 @@ BASE = """
   }
 
   grid.addEventListener("click", function (e) {
+    // The select column is not an editable cell — a click there chooses rows
+    // and must never open an editor, so it is handled and dropped first.
+    if (selAll && e.target === selAll) { pickAll(selAll.checked); return; }
+    var sel = e.target.closest("input.rowsel");
+    if (sel) { pick(sel, e.shiftKey); return; }
+    if (e.target.closest("td.pick")) return;
     // A pick from the dropdown bubbles through the cell it belongs to; it is
     // the selection, not a fresh click on that cell.
     if (e.target.closest(".cbx, .amt")) return;
@@ -1602,6 +1734,10 @@ def transactions():
                 f" data-date=\"{esc(t['txn_date'])}\""
                 f" data-description=\"{esc(t['description'])}\""
                 f" data-cents='{cents}'>"
+                # Not an editable cell: clicking here selects the row, and the
+                # grid's delegation drops it before any editor can open.
+                + "<td class=pick><input type=checkbox class=rowsel"
+                  " aria-label='Select row'></td>"
                 + edit_cell("date", esc(t["txn_date"]))
                 + edit_cell("description", esc(t["description"]))
                 + edit_cell("category", esc(catname))
@@ -1611,7 +1747,9 @@ def transactions():
                 + edit_cell("debit", debit, cls="r num ed")
                 + edit_cell("credit", credit, cls="r num ed") + "</tr>")
     # Debit opens on asc (biggest money out on top), Credit on desc (biggest in).
-    heads = (sort_header("Date", "date", "desc", sort, direction)
+    heads = ("<th class=pick><input type=checkbox id=sel-all"
+             " aria-label='Select all rows'></th>"
+             + sort_header("Date", "date", "desc", sort, direction)
              + sort_header("Description", "desc", "asc", sort, direction)
              + sort_header("Category", "cat", "asc", sort, direction)
              + "<th>Use</th><th>Status</th><th>Note</th>"
@@ -1620,11 +1758,28 @@ def transactions():
              + sort_header("Credit", "amount", "desc", sort, direction,
                            cls=" class=r", arrow_dir="DESC"))
     # The picker's whole vocabulary, handed over once. No fetch, no round trip.
-    cats = script_json(db.category_names(conn))
+    names = db.category_names(conn)
+    cats = script_json(names)
+    # A plain <select> for the bulk category. The type-ahead combobox stays on
+    # the cells, where you are picking for one row at a time.
+    options = "".join(f'<option value="{esc(n)}">{esc(n)}</option>' for n in names)
+    # Rendered hidden and stays hidden without JS: bulk needs the checkboxes,
+    # and the checkboxes need JS. The table itself still reads fine either way.
+    bulk_bar = f"""<div id="bulk-bar" class=bulk hidden>
+        <span class=n id="bulk-count">0 selected</span>
+        <select id="bulk-cat" aria-label="Category for the selected rows">{options}</select>
+        <button type=button class=btn data-bulk="category">Apply</button>
+        <button type=button class="btn ghost" data-bulk="business">Business</button>
+        <button type=button class="btn ghost" data-bulk="personal">Personal</button>
+        <button type=button class="btn danger" data-bulk="delete">Delete</button>
+        <button type=button class="btn ghost" data-bulk="clear">Clear</button>
+      </div>"""
     body = f"""<h1>Transactions</h1>
       <p class=sub>{len(rows)} transactions in {YEAR}. Click any cell but Status
-      to edit it — changes save as you go and stay on this row.</p>
+      to edit it — changes save as you go and stay on this row. Tick the boxes
+      (shift-click for a range) to set a category or use on many rows at once.</p>
       <script type="application/json" id="cat-list">{cats}</script>
+      {bulk_bar}
       <table id="txn-grid"><tr>{heads}</tr>{trs}</table>"""
     return page(body, "txns")
 
@@ -1729,6 +1884,79 @@ def transactions_update():
                    description=saved["description"],
                    amount_cents=saved["amount_cents"],
                    debit=debit, credit=credit)
+
+
+BULK_ACTIONS = ("category", "use", "delete")
+
+
+@app.route("/transactions/bulk", methods=["POST"])
+def transactions_bulk():
+    """Apply one action to many rows at once from the transactions grid.
+
+    Form: `ids` repeated once per row (the grid appends one field per checked
+    box — comma-joined ids are NOT accepted), `action` in BULK_ACTIONS, and
+    `value` for category/use.
+
+    Like /transactions/update, this NEVER calls teach_merchant_rule. Bulk is
+    still the corrections surface: stamping forty rows with a category says
+    nothing about what those merchants mean, and forty rows is exactly where a
+    silent rule would do the most damage. Teaching stays on /categorize.
+
+    Delete is a real delete — the dedup_key goes with the row, so re-importing
+    the same statement will bring those lines back. That is the same bargain as
+    undoing an import, and it is why nothing here touches import_batches: the
+    import history computes its counts live from the transactions still
+    present, so a batch whose rows you bulk-deleted reports itself honestly
+    without any bookkeeping on this side.
+
+    SQL safety: the IN (...) clause is a run of `?` placeholders bound to ints
+    that survived int() — no id ever reaches the SQL string. `action` and `use`
+    are whitelisted; a category is a dict lookup, never text in a query. Same
+    no-CSRF posture as every other POST here — single user, bound to localhost.
+
+    Validation all happens before the single statement, so a rejected request
+    wrote nothing at all.
+    """
+    conn = get_conn()
+
+    ids = []
+    for raw in request.form.getlist("ids"):
+        try:
+            ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue        # anything that is not an integer is simply not an id
+    if not ids:
+        return jsonify(ok=False, error="no valid ids"), 400
+
+    action = request.form.get("action", "")
+    if action not in BULK_ACTIONS:
+        return jsonify(ok=False, error="unknown action"), 400
+
+    holes = ",".join("?" * len(ids))     # placeholders, never values
+    if action == "category":
+        cat_id = db.category_map(conn)
+        # Unknown name lands on Uncategorized — the same fallback the importer,
+        # /review and the single-row grid edit already use.
+        cid = cat_id.get(request.form.get("value", ""), cat_id["Uncategorized"])
+        affected = conn.execute(
+            f"""UPDATE transactions
+                   SET category_id=?, category_source='user', reviewed=1
+                 WHERE id IN ({holes})""", [cid] + ids).rowcount
+    elif action == "use":
+        use = request.form.get("value", "")
+        if use not in VALID_USES:
+            return jsonify(ok=False, error="use must be business or personal"), 400
+        # reviewed is left alone, exactly as a single-row use edit leaves it:
+        # which pocket a charge came out of is not a decision about what it is.
+        affected = conn.execute(
+            f"UPDATE transactions SET use=? WHERE id IN ({holes})",
+            [use] + ids).rowcount
+    else:
+        affected = conn.execute(
+            f"DELETE FROM transactions WHERE id IN ({holes})", ids).rowcount
+    conn.commit()
+
+    return jsonify(ok=True, action=action, affected=affected)
 
 
 def normalize_date(raw):
