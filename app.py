@@ -26,6 +26,13 @@ Multi-select and the bulk actions built on it (set category, set use, delete)
 inherit both rules: they stamp the selected rows and teach nothing, and a bulk
 delete takes each row's dedup_key with it, so re-importing the same statement
 re-adds exactly what was deleted — the same bargain as undoing an import.
+
+The import mapping page can save a column layout as a named profile. Those live
+in one small JSON file (LEDGER_PROFILES, default localledger_profiles.json)
+beside this one — deliberately NOT in a ledger_YYYY.sqlite, so a bank's layout
+is global across years and the schema is untouched. A profile stores each
+column's header NAME as well as its index, and applying one matches by name
+first, so a bank reordering its export doesn't cost you the mapping.
 """
 
 import csv
@@ -38,7 +45,8 @@ import sqlite3
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from flask import Flask, request, redirect, url_for, render_template_string, jsonify
+from flask import (Flask, Response, request, redirect, url_for,
+                   render_template_string, jsonify)
 
 import db
 from categorizer import Categorizer, normalize_merchant, ollama_available
@@ -246,6 +254,169 @@ def mapping_is_complete(m):
         else m["debit"] is None or m["credit"] is None))
 
 
+# ------------------------- saved column profiles --------------------------
+# A bank's CSV layout is a property of the bank, not of a year, so profiles
+# live in ONE small JSON file beside app.py — deliberately not in any
+# ledger_YYYY.sqlite. No schema change, no migration, and a profile saved
+# while working on 2026 is there when 2027's file is opened. The path is read
+# at call time (never cached at import) so a test can point it somewhere else.
+PROFILES_VERSION = 1
+PROFILE_ROLES = ("date", "desc", "amount", "debit", "credit")
+MAX_PROFILE_NAME = 120
+MAX_PROFILE_FILE = 512 * 1024          # a store this big is not a mapping file
+
+
+def profiles_path():
+    return os.environ.get("LEDGER_PROFILES", "localledger_profiles.json")
+
+
+def empty_profiles():
+    return {"version": PROFILES_VERSION, "profiles": {}}
+
+
+def valid_profile(prof):
+    """Is this entry shaped like a profile? Used on anything read off disk."""
+    if not isinstance(prof, dict):
+        return False
+    if prof.get("mode") not in ("single", "debitcredit"):
+        return False
+    for role in PROFILE_ROLES:
+        got = prof.get(role)
+        if got is None:
+            continue
+        if not isinstance(got, dict) or not isinstance(got.get("name"), str):
+            return False
+        idx = got.get("index")
+        if idx is not None and (not isinstance(idx, int) or isinstance(idx, bool)):
+            return False
+    return True
+
+
+def clean_profile(prof):
+    """The canonical stored shape, so an imported file can't smuggle in extras."""
+    out = {
+        "mode": prof.get("mode"),
+        "sign": prof.get("sign") if prof.get("sign") in dict(SIGN_CHOICES) else "negative",
+    }
+    for role in PROFILE_ROLES:
+        got = prof.get(role)
+        out[role] = ({"name": got.get("name"), "index": got.get("index")}
+                     if isinstance(got, dict) else None)
+    return out
+
+
+def load_profiles():
+    """The whole store. A missing, empty, or corrupt file is an EMPTY store.
+
+    This is called on the way into the import page, so it must never raise:
+    a hand-edited file with a stray comma should cost you your profiles, not
+    your ability to import a statement. Entries that don't look like profiles
+    are dropped here rather than at every use site.
+    """
+    try:
+        with open(profiles_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):          # missing, unreadable, or not JSON
+        return empty_profiles()
+    if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
+        return empty_profiles()
+    return {
+        "version": PROFILES_VERSION,
+        "profiles": {name: clean_profile(prof)
+                     for name, prof in data["profiles"].items()
+                     if isinstance(name, str) and valid_profile(prof)},
+    }
+
+
+def save_profiles(data):
+    """Write the store atomically: full temp file, then one rename.
+
+    os.replace is atomic on the same filesystem, so a crash (or a full disk)
+    mid-write leaves the previous store intact instead of a truncated file
+    that load_profiles would have to throw away.
+    """
+    path = profiles_path()
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def profile_names():
+    return sorted(load_profiles()["profiles"])
+
+
+def mapping_to_profile(mapping, header):
+    """An effective_mapping (indices) -> the stored shape (name + index).
+
+    Both are kept for every role. The name is what makes a profile survive a
+    bank reordering its export; the index is the fallback for a file whose
+    header text has changed but whose layout hasn't.
+    """
+    def role(i):
+        if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < len(header):
+            return None
+        return {"name": header[i].strip(), "index": i}
+
+    mode = mapping.get("mode")
+    return {
+        "mode": mode if mode in ("single", "debitcredit") else "single",
+        "sign": mapping.get("sign") if mapping.get("sign") in dict(SIGN_CHOICES)
+                else "negative",
+        "date": role(mapping.get("date")), "desc": role(mapping.get("desc")),
+        "amount": role(mapping.get("amount")), "debit": role(mapping.get("debit")),
+        "credit": role(mapping.get("credit")),
+    }
+
+
+def profile_to_mapping(profile, header):
+    """A stored profile -> an effective_mapping-shaped dict of indices.
+
+    Name first, index second: match the saved header text against this file's
+    header (trimmed, case-insensitive) and use whatever column it landed in
+    today; only if the name is gone fall back to the index it had when saved,
+    and only if that is still in range. A role that resolves to neither is
+    None, which the mapping page renders and read_row treats as an unreadable
+    row — the same as any other incomplete mapping.
+    """
+    by_name = {}
+    for i, h in enumerate(header):
+        by_name.setdefault(h.strip().lower(), i)      # first column of a name wins
+
+    def resolve(role):
+        if not isinstance(role, dict):
+            return None
+        name = role.get("name")
+        if isinstance(name, str):
+            found = by_name.get(name.strip().lower())
+            if found is not None:
+                return found
+        idx = role.get("index")
+        if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < len(header):
+            return idx
+        return None
+
+    mapping = {role: resolve(profile.get(role)) for role in PROFILE_ROLES}
+    mode = profile.get("mode")
+    mapping["mode"] = mode if mode in ("single", "debitcredit") else "single"
+    mapping["sign"] = (profile.get("sign") if profile.get("sign") in dict(SIGN_CHOICES)
+                       else "negative")
+    return mapping
+
+
+def merge_profiles(store, incoming):
+    """Copy well-formed entries over the store by name. Returns how many landed."""
+    merged = 0
+    for name, prof in incoming.items():
+        if not isinstance(name, str) or not name.strip() or not valid_profile(prof):
+            continue
+        store["profiles"][name.strip()[:MAX_PROFILE_NAME]] = clean_profile(prof)
+        merged += 1
+    return merged
+
+
 def cell(row, i):
     """The cell at column `i`, or None if `i` isn't a usable index into the row.
 
@@ -384,6 +555,15 @@ BASE = """
     display:flex;flex-direction:column;gap:14px;max-width:520px}
   .status{font-size:13px;padding:6px 10px;border-radius:8px}
   .status.on{background:#e7f2ec;color:var(--settled)} .status.off{background:#f0eee8;color:var(--muted)}
+  /* --- import mapping: the saved-profiles bar (plain forms, no script) --- */
+  .profiles{display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+    padding:0 0 12px;margin:0 0 4px;border-bottom:1px solid var(--line)}
+  .profiles .btn{padding:6px 12px;font-size:13px}
+  .profiles select{padding:6px 9px;font-size:13px}
+  /* the shared input rule is a wide flexing text box; this bar wants neither */
+  .profiles input[type=text]{min-width:0;flex:0 0 auto;width:190px;padding:6px 9px;font-size:13px}
+  .profiles input[type=file]{font-size:12px;max-width:190px}
+  .profiles .gap{flex:1 1 auto}
   /* --- transactions grid: inline editing (category / use / note) --- */
   td.ed{cursor:pointer;position:relative}
   td.ed:hover{background:#f6f4ee;box-shadow:inset 0 0 0 1px var(--line)}
@@ -1176,8 +1356,49 @@ def money_column(chosen, headers, field, avoid=None):
     return 1 if avoid == 0 and len(headers) > 1 else 0
 
 
-def mapping_body(token, stash, m):
-    """The mapping + preview screen. Renders, never writes."""
+def profiles_bar(token, selected=""):
+    """The Profiles row above the column selects. Plain forms — no JS at all.
+
+    Apply / Delete / Save live INSIDE the mapping form (the caller renders this
+    as its first child), so a "Save as" captures exactly the selects that are
+    on screen and an Apply carries the token without a round-trip of its own.
+    The file import needs multipart and a form cannot nest inside another form,
+    so its controls join a sibling `<form id=profile-file>` through the HTML
+    `form=` attribute. That keeps one visual bar out of two real forms, with
+    nothing scripted: with JS off this behaves identically.
+    """
+    names = profile_names()
+    if names:
+        opts = "".join(
+            f"<option value=\"{esc(n)}\"{' selected' if n == selected else ''}>"
+            f"{esc(n)}</option>" for n in names)
+        pick = (f"<select name=profile_name>{opts}</select>"
+                f"<button class='btn ghost' formaction=\"{url_for('apply_profile')}\">"
+                f"Apply</button>"
+                f"<button class='btn ghost' formaction=\"{url_for('delete_profile')}\">"
+                f"Delete</button>")
+    else:
+        pick = "<span class=src>No saved profiles yet.</span>"
+
+    return f"""
+        <div class=profiles>
+          <label class=lbl>Profiles</label>
+          {pick}
+          <input type=text name=save_as placeholder="Save this mapping as…">
+          <button class='btn ghost' formaction="{url_for('save_profile')}">Save</button>
+          <span class=gap></span>
+          <a class='btn ghost' href="{url_for('export_profiles')}">Export</a>
+          <input type=file name=file accept=.json form=profile-file>
+          <button class='btn ghost' form=profile-file>Import</button>
+        </div>"""
+
+
+def mapping_body(token, stash, m, note="", selected=""):
+    """The mapping + preview screen. Renders, never writes.
+
+    `note` is the one-line result of a profile action (saved / applied /
+    deleted / imported); `selected` keeps that profile chosen in the bar.
+    """
     headers, data = stash["header"], stash["data"]
 
     # Both money groups render whatever the mode is — the script below hides the
@@ -1226,14 +1447,25 @@ def mapping_body(token, stash, m):
     prenote = (f"<p class=sub>skipped {pre} preamble row{'' if pre == 1 else 's'} "
                f"above the header.</p>" if pre else "")
 
+    # Escaped like any other value that came off the page: a note can carry a
+    # profile name, and a profile name is user input.
+    notehtml = (f"<p class=sub><span class='status off'>{esc(note)}</span></p>"
+                if note else "")
+
     return f"""
       <h1>Check the columns</h1>
       <p class=sub>{esc(stash['filename'])} — nothing has been imported yet.
          Adjust anything that looks wrong, preview it, then import.</p>
       {prenote}
+      {notehtml}
+      <form method=post id=profile-file enctype=multipart/form-data
+            action="{url_for('import_profiles')}">
+        <input type=hidden name=token value="{esc(token)}">
+      </form>
       <form method=post class=rev id=map-form>
         <input type=hidden name=token value="{esc(token)}">
         <input type=hidden name=account_id value="{stash['account_id']}">
+        {profiles_bar(token, selected)}
         <div class=field>
           <span><label class=lbl>Date column</label>
             {column_select('date_col', headers, m['date'])}</span>
@@ -1291,6 +1523,131 @@ def preview_import():
         return redirect(url_for("do_import", msg=EXPIRED))
     m = effective_mapping(stash["detected"], len(stash["header"]))
     return page(mapping_body(request.form["token"], stash, m), "import")
+
+
+def profile_form_name(*fields):
+    """The profile name this POST is about, from the first field it carries.
+
+    The bar has two name inputs in one form — the Apply/Delete <select> and the
+    "Save as" box — so they cannot share an attribute name. Save reads its own
+    box first and falls back to `profile_name`, so a bare {token, profile_name}
+    post still saves.
+    """
+    for field in fields:
+        if field in request.form:
+            return request.form[field].strip()[:MAX_PROFILE_NAME]
+    return ""
+
+
+def profile_page(token, stash, m, note, selected=""):
+    return page(mapping_body(token, stash, m, note, selected), "import")
+
+
+@app.route("/import/profile/save", methods=["POST"])
+def save_profile():
+    """Save the mapping now on screen under a name. Writes the JSON file only."""
+    token = request.form.get("token", "")
+    stash = PENDING_IMPORTS.get(token)
+    if stash is None:
+        return redirect(url_for("do_import", msg=EXPIRED))
+
+    m = effective_mapping(stash["detected"], len(stash["header"]))
+    name = profile_form_name("save_as", "profile_name")
+    if not name:
+        return profile_page(token, stash, m, "Name the profile before saving it.")
+
+    store = load_profiles()
+    store["profiles"][name] = mapping_to_profile(m, stash["header"])
+    save_profiles(store)
+    return profile_page(token, stash, m, f"Saved profile '{name}'.", name)
+
+
+@app.route("/import/profile/apply", methods=["POST"])
+def apply_profile():
+    """Re-render the mapping page under a saved profile. Writes nothing."""
+    token = request.form.get("token", "")
+    stash = PENDING_IMPORTS.get(token)
+    if stash is None:
+        return redirect(url_for("do_import", msg=EXPIRED))
+
+    name = profile_form_name("profile_name")
+    profile = load_profiles()["profiles"].get(name)
+    if profile is None:
+        # Deleted in another tab, or an empty picker: say so and leave the
+        # mapping exactly as the user had it.
+        m = effective_mapping(stash["detected"], len(stash["header"]))
+        note = f"No profile named '{name}'." if name else "Choose a profile to apply."
+        return profile_page(token, stash, m, note)
+
+    m = profile_to_mapping(profile, stash["header"])
+    return profile_page(token, stash, m, f"Applied profile '{name}'.", name)
+
+
+@app.route("/import/profile/delete", methods=["POST"])
+def delete_profile():
+    """Forget one profile. Touches no ledger data — this is the JSON file only."""
+    token = request.form.get("token", "")
+    stash = PENDING_IMPORTS.get(token)
+    if stash is None:
+        return redirect(url_for("do_import", msg=EXPIRED))
+
+    name = profile_form_name("profile_name")
+    store = load_profiles()
+    if name in store["profiles"]:
+        del store["profiles"][name]
+        save_profiles(store)
+        note = f"Deleted profile '{name}'."
+    else:
+        note = f"No profile named '{name}'." if name else "Choose a profile to delete."
+    m = effective_mapping(stash["detected"], len(stash["header"]))
+    return profile_page(token, stash, m, note)
+
+
+@app.route("/import/profiles/export")
+def export_profiles():
+    """Hand back the store as a download — a local file copy, not a network call."""
+    payload = json.dumps(load_profiles(), indent=2, sort_keys=True)
+    return Response(payload, mimetype="application/json", headers={
+        "Content-Disposition": 'attachment; filename="localledger-profiles.json"'})
+
+
+@app.route("/import/profiles/import", methods=["POST"])
+def import_profiles():
+    """Merge an exported profiles file into this machine's store, by name.
+
+    Everything about the file is suspect: it may not be JSON, may not be a
+    store, may hold entries that aren't profiles. Each of those is a note on
+    the page, never a traceback, and a file that fails to parse leaves the
+    store exactly as it was.
+    """
+    token = request.form.get("token", "")
+    stash = PENDING_IMPORTS.get(token)
+
+    upload = request.files.get("file")
+    raw = upload.read(MAX_PROFILE_FILE + 1) if upload and upload.filename else b""
+    incoming = None
+    if raw and len(raw) <= MAX_PROFILE_FILE:
+        try:
+            parsed = json.loads(raw.decode("utf-8-sig", errors="replace"))
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("profiles"), dict):
+            incoming = parsed["profiles"]
+
+    if incoming is None:
+        note = "Couldn't read that profiles file."
+    else:
+        store = load_profiles()
+        merged = merge_profiles(store, incoming)
+        save_profiles(store)
+        note = f"Imported {merged} profile{'' if merged == 1 else 's'}."
+
+    if stash is None:
+        # No live upload to go back to (expired token, or imported from the
+        # import page): the note rides the redirect instead.
+        return redirect(url_for("do_import", msg=note))
+    m = effective_mapping(stash["detected"], len(stash["header"]))
+    return profile_page(token, stash, m, note)
 
 
 @app.route("/import/commit", methods=["POST"])
