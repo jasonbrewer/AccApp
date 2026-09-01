@@ -113,6 +113,25 @@ newer OS or that won't run on Ventura.
   specific (longest) rule wins.
 - Categories are broad and few (see `SEED_CATEGORIES`) — tags/aliases over deep
   trees. Don't proliferate categories.
+- **Categories nest.** A category may have a `parent_id` (NULL = top level).
+  One with at least one child is a **heading**; one with no children is a
+  **leaf**. The shape is managed on `/categories`; the seeds stay flat, so a
+  fresh book is exactly as it always was.
+  - **Transactions and `merchant_rules` point at LEAVES ONLY.** A heading is a
+    heading — its total is the sum of its children, and nothing is ever posted
+    directly to it. Every picker renders `db.leaf_choices()` and every
+    assignment resolves through `db.resolve_leaf()`; a heading's name, like a
+    name nobody knows, falls back to "Uncategorized".
+  - Names stay **globally unique**, which is why a category still travels by
+    NAME on every wire (form value, autosave, embedded grid list) and only the
+    DISPLAY learned the path. The path label is `A › B › C` (`db.CATEGORY_SEP`),
+    from `db.category_labels()`.
+  - **Adding a child to a category that holds transactions is blocked** — those
+    rows would sit outside every child and stop adding up. Move them first. A
+    move onto such a category is the same question and gets the same block.
+  - **A category with children, transactions, or a merchant rule cannot be
+    deleted.** Only a genuinely unused leaf goes. "Uncategorized" is the system
+    leaf: never renamed, moved, deleted, or given children.
 - `use` = business | personal, per-transaction, defaulting to the account's
   `default_use`.
 - Keep the UI quiet: tabular figures for amounts, one accent color reserved for
