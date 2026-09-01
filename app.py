@@ -703,6 +703,7 @@ BASE = """
     <a href="{{ url_for('review') }}" class="{{ 'on' if page=='review' }}">Review{% if need %} · {{ need }}{% endif %}</a>
     <a href="{{ url_for('categorize') }}" class="{{ 'on' if page=='cat' }}">Categorize</a>
     <a href="{{ url_for('transactions') }}" class="{{ 'on' if page=='txns' }}">Transactions</a>
+    <a href="{{ url_for('categories') }}" class="{{ 'on' if page=='cats' }}">Categories</a>
   </nav>
 </div></header>
 <main>{{ body|safe }}</main>
@@ -724,12 +725,17 @@ BASE = """
 
   var SAVE_URL = "{{ url_for('transactions_update') }}";
   var src = document.getElementById("cat-list");
+  /* Leaves only, each {name, label}: `name` is the wire value the server has
+     always been sent, `label` is its full "A \u203a B" path. Headings are not in
+     here at all, because nothing is ever assigned to one. */
   var CATS = src ? JSON.parse(src.textContent) : [];
 
-  /* A category is its bare name today. When categories nest, this is the only
-     place that has to learn to say "Parent > Child" — the filter, the list and
-     the cell all read whatever it returns. */
-  function label(name) { return name; }
+  /* Categories nest now, and this is the seam that was left for it: the
+     filter, the list and the cell all read whatever it returns. A path the
+     server already labelled comes back untouched. */
+  var PATHS = {};
+  CATS.forEach(function (c) { PATHS[c.name] = c.label; });
+  function label(name) { return PATHS[name] || name; }
 
   /* ---- the two shared editors ---- */
   var box = document.createElement("div");
@@ -903,8 +909,8 @@ BASE = """
   /* ---- category: type-ahead combobox ---- */
   function filter(q) {
     var needle = q.trim().toLowerCase();
-    matches = CATS.filter(function (name) {
-      return !needle || label(name).toLowerCase().indexOf(needle) !== -1;
+    matches = CATS.filter(function (c) {
+      return !needle || c.label.toLowerCase().indexOf(needle) !== -1;
     });
     hi = matches.length ? 0 : -1;
     draw();
@@ -919,10 +925,10 @@ BASE = """
       list.appendChild(none);
       return;
     }
-    matches.forEach(function (name, i) {
+    matches.forEach(function (c, i) {
       var li = document.createElement("li");
-      li.textContent = label(name);
-      li.setAttribute("data-name", name);
+      li.textContent = c.label;
+      li.setAttribute("data-name", c.name);
       if (i === hi) li.className = "on";
       list.appendChild(li);
     });
@@ -965,7 +971,7 @@ BASE = """
     } else if (e.key === "Enter") {
       e.preventDefault();
       // Only a highlighted, real category can be chosen. Free text never saves.
-      if (hi >= 0) chooseCategory(matches[hi]);
+      if (hi >= 0) chooseCategory(matches[hi].name);   // the NAME goes on the wire
     } else if (e.key === "Escape") {
       e.preventDefault();
       var o = closeEditor();
@@ -1859,7 +1865,9 @@ def commit_import():
     if not mapping_is_complete(cols):
         return page(mapping_body(token, stash, cols), "import")
 
-    cat_names = db.category_names(conn)
+    # Leaves only, here too: the model is offered the assignable categories,
+    # and whatever comes back is resolved as a leaf or lands on Uncategorized.
+    cat_names = [c["name"] for c in db.leaf_choices(conn)]
     cz = Categorizer(conn, cat_names)
     now = datetime.utcnow().isoformat()
     # source_path is the stash's, which only the native picker ever sets: a
@@ -1891,7 +1899,7 @@ def commit_import():
         dedup = f"{base}#{seen[base]}"
 
         guess = cz.categorize(desc, cents, merchant)
-        cid = cat_id.get(guess["category"], cat_id["Uncategorized"])
+        cid = db.resolve_leaf(conn, guess["category"]) or cat_id["Uncategorized"]
         try:
             conn.execute(
                 """INSERT INTO transactions
@@ -2025,14 +2033,16 @@ def review():
                 # Anything else would be stored and then silently dropped from the
                 # dashboard, which only totals business + personal.
                 use = row["default_use"]
-            cid = cat_id.get(catname, cat_id["Uncategorized"])
+            # Leaves only: a heading's name is no more assignable than a name
+            # nobody knows, and both land on Uncategorized.
+            cid = db.resolve_leaf(conn, catname) or cat_id["Uncategorized"]
             conn.execute(
                 """UPDATE transactions
                      SET category_id=?, category_source='user', use=?, note=?, reviewed=1
                    WHERE id=?""",
                 (cid, use, note, tid))
             # learn: this merchant -> this category/use, so next time it's rule-matched
-            if catname != "Uncategorized":
+            if cid != cat_id["Uncategorized"]:
                 teach_merchant_rule(conn, row["merchant_norm"], cid, use)
         conn.commit()
         return redirect(url_for("review"))
@@ -2046,7 +2056,7 @@ def review():
             ORDER BY t.txn_date, t.id LIMIT 2"""
     ).fetchall()
     remaining = conn.execute("SELECT COUNT(*) n FROM transactions WHERE reviewed=0").fetchone()["n"]
-    cats = db.category_names(conn)
+    cats = db.leaf_choices(conn)
 
     if not batch:
         body = """<h1>Review</h1>
@@ -2056,8 +2066,7 @@ def review():
 
     def card(t):
         suggested = t["catname"] or "Uncategorized"
-        opts = "".join(
-            f"<option {'selected' if c==suggested else ''}>{esc(c)}</option>" for c in cats)
+        opts = leaf_options(cats, suggested)
         use = txn_use(t)
         src = {"rule": "matched a learned rule", "ai": f"AI suggestion · {int((t['ai_confidence'] or 0)*100)}%",
                "none": "no match — pick one", "user": "you set this"}.get(t["category_source"], "")
@@ -2097,10 +2106,23 @@ def review():
 LEAVE = "— leave unchanged —"
 
 
+def leaf_options(cats, selected=None):
+    """<option> list for a category picker, from leaf_choices().
+
+    The value is the bare NAME and the text is the full path label. That split
+    is the whole trick: nesting changes what a picker SHOWS and never what it
+    SENDS, so every form and the grid's autosave keep the contract they had
+    before categories could nest. Headings are simply not in the list.
+    """
+    return "".join(
+        f'<option value="{esc(c["name"])}"'
+        f'{" selected" if c["name"] == selected else ""}>{esc(c["label"])}</option>'
+        for c in cats)
+
+
 def cat_select(name, cats):
     """Category picker that defaults to leaving the row/group alone."""
-    opts = f"<option value=''>{LEAVE}</option>" + "".join(
-        f"<option>{esc(c)}</option>" for c in cats)
+    opts = f"<option value=''>{LEAVE}</option>" + leaf_options(cats)
     return f"<select name={name}>{opts}</select>"
 
 
@@ -2177,7 +2199,7 @@ def categorize():
             catname = request.form.get(f"group_cat_{i}", "")
             if not norm or not catname:      # "— leave unchanged —"
                 continue
-            cid = cat_id.get(catname, uncategorized)
+            cid = db.resolve_leaf(conn, catname) or uncategorized
             use = request.form.get(f"group_use_{i}")
             if use not in VALID_USES:
                 use = group_default_use(conn, norm)
@@ -2215,7 +2237,7 @@ def categorize():
                 (tid,)).fetchone()
             if row is None:
                 continue
-            cid = cat_id.get(catname, uncategorized)
+            cid = db.resolve_leaf(conn, catname) or uncategorized
             use = request.form.get(f"row_use_{tid}")
             if use not in VALID_USES:
                 use = txn_use(row) if txn_use(row) in VALID_USES else "business"
@@ -2231,7 +2253,8 @@ def categorize():
             msg=f"Updated {len(touched)} transactions across {merchants} merchants."))
 
     rows, ordered = merchant_groups(conn)
-    cats = db.category_names(conn)
+    cats = db.leaf_choices(conn)
+    labels = db.category_labels(conn)
     if not rows:
         return page("<h1>Categorize</h1><div class=empty>No transactions yet. "
                     "Import a statement to begin.</div>", "cat")
@@ -2253,7 +2276,8 @@ def categorize():
                 f"<tr><td>{esc(t['txn_date'])}</td>"
                 f"<td>{esc(t['description'])}</td>"
                 f"<td class='r num'>{money(t['amount_cents'])}</td>"
-                f"<td>{esc(t['catname'] or 'Uncategorized')} · {esc(use.title())}</td>"
+                f"<td>{esc(labels.get(t['category_id'], 'Uncategorized'))}"
+                f" · {esc(use.title())}</td>"
                 f"<td>{state}</td>"
                 f"<td>{cat_select('row_cat_%d' % tid, cats)}</td>"
                 f"<td>{use_select('row_use_%d' % tid, use)}</td></tr>")
@@ -2369,10 +2393,12 @@ def transactions():
     if not rows:
         return page("<h1>Transactions</h1><div class=empty>No transactions yet.</div>", "txns")
 
+    # Display is the path ("A › B"); the picker still sends the bare name.
+    labels = db.category_labels(conn)
     trs = ""
     for t in rows:
         use = txn_use(t)
-        catname = t["catname"] or "Uncategorized"
+        catname = labels.get(t["category_id"], "Uncategorized")
         upill = f"<span class='pill {'b' if use=='business' else 'p'}'>{esc(use.title())}</span>"
         state = ("<span class='pill settled'>Reviewed</span>" if t["reviewed"]
                  else "<span class='pill review'>Needs review</span>")
@@ -2412,11 +2438,13 @@ def transactions():
              + sort_header("Credit", "amount", "desc", sort, direction,
                            cls=" class=r", arrow_dir="DESC"))
     # The picker's whole vocabulary, handed over once. No fetch, no round trip.
-    names = db.category_names(conn)
-    cats = script_json(names)
+    # Leaves only, each as {name, label}: nothing is ever assigned to a heading,
+    # so a heading is not offered anywhere a category can be chosen.
+    choices = db.leaf_choices(conn)
+    cats = script_json([{"name": c["name"], "label": c["label"]} for c in choices])
     # A plain <select> for the bulk category. The type-ahead combobox stays on
     # the cells, where you are picking for one row at a time.
-    options = "".join(f'<option value="{esc(n)}">{esc(n)}</option>' for n in names)
+    options = leaf_options(choices)
     # Rendered hidden and stays hidden without JS: bulk needs the checkboxes,
     # and the checkboxes need JS. The table itself still reads fine either way.
     bulk_bar = f"""<div id="bulk-bar" class=bulk hidden>
@@ -2471,9 +2499,10 @@ def transactions_update():
     sets, vals = [], []
     if "category" in request.form:
         cat_id = db.category_map(conn)
-        # An unknown name is not an error the user can see — it lands on
-        # Uncategorized, the same fallback the importer and /review use.
-        cid = cat_id.get(request.form["category"], cat_id["Uncategorized"])
+        # Leaves only. A heading's name is not assignable, and neither is a
+        # name nobody knows; both land on Uncategorized, the same fallback the
+        # importer and /review use, and neither is an error the user can see.
+        cid = db.resolve_leaf(conn, request.form["category"]) or cat_id["Uncategorized"]
         sets += ["category_id=?", "category_source='user'", "reviewed=1"]
         vals.append(cid)
     if "use" in request.form:
@@ -2524,15 +2553,18 @@ def transactions_update():
     # grid repaints from the database rather than from its own optimism.
     saved = conn.execute(
         """SELECT t.id, t.txn_date, t.description, t.amount_cents, t.use, t.note,
-                  t.reviewed, a.default_use, c.name catname
+                  t.reviewed, t.category_id, a.default_use, c.name catname
              FROM transactions t
              JOIN accounts a ON a.id=t.account_id
              LEFT JOIN categories c ON c.id=t.category_id
             WHERE t.id=?""", (row["id"],)).fetchone()
     # money() runs here, not in the browser: the client does no money math.
     debit, credit = amount_cells(saved["amount_cents"])
+    # The reply's `category` is for DISPLAY, so it is the path label; the
+    # picker goes on sending the bare name.
+    labels = db.category_labels(conn)
     return jsonify(ok=True, id=saved["id"],
-                   category=saved["catname"] or "Uncategorized",
+                   category=labels.get(saved["category_id"], "Uncategorized"),
                    use=txn_use(saved), reviewed=saved["reviewed"],
                    note=saved["note"], date=saved["txn_date"],
                    description=saved["description"],
@@ -2589,9 +2621,11 @@ def transactions_bulk():
     holes = ",".join("?" * len(ids))     # placeholders, never values
     if action == "category":
         cat_id = db.category_map(conn)
-        # Unknown name lands on Uncategorized — the same fallback the importer,
-        # /review and the single-row grid edit already use.
-        cid = cat_id.get(request.form.get("value", ""), cat_id["Uncategorized"])
+        # Leaves only, and an unknown name lands on Uncategorized — the same
+        # fallback the importer, /review and the single-row grid edit already
+        # use. Forty rows is exactly where a heading must not be stampable.
+        cid = (db.resolve_leaf(conn, request.form.get("value", ""))
+               or cat_id["Uncategorized"])
         affected = conn.execute(
             f"""UPDATE transactions
                    SET category_id=?, category_source='user', reviewed=1
@@ -2611,6 +2645,262 @@ def transactions_bulk():
     conn.commit()
 
     return jsonify(ok=True, action=action, affected=affected)
+
+
+# --------------------------- category management ---------------------------
+# The tree lives behind four plain server forms — add, rename, move, delete —
+# with no JavaScript anywhere near it. Every one of them can only refuse in one
+# way: it returns a sentence, the page renders it as a note, and nothing was
+# written. There is no 500 on this page and no half-applied change.
+#
+# Two rules do most of the work here:
+#   * A category that HOLDS transactions cannot be given a child. A heading's
+#     total is the sum of its children, so those rows would sit outside every
+#     child and silently stop adding up. Move them first.
+#   * Uncategorized is the system leaf. It is where every unresolvable name
+#     lands, so it can never be renamed, moved, deleted, or given children.
+
+
+def category_row(conn, raw_id):
+    """One category by id from a form field, or None if that is not one."""
+    try:
+        cid = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT id, name, parent_id FROM categories WHERE id=?", (cid,)).fetchone()
+
+
+def name_taken(conn, name):
+    """Names are globally unique (UNIQUE(name)) whatever the tree looks like."""
+    return conn.execute(
+        "SELECT 1 FROM categories WHERE name=? LIMIT 1", (name,)).fetchone() is not None
+
+
+def direct_txns(conn, cat_id):
+    """Transactions pointed straight at this category — not at its children."""
+    return conn.execute(
+        "SELECT COUNT(*) n FROM transactions WHERE category_id=?",
+        (cat_id,)).fetchone()["n"]
+
+
+def plural(n, one, many):
+    return f"{n} {one if n == 1 else many}"
+
+
+def parent_block(conn, parent):
+    """Why `parent` cannot be given a child right now, or "" if it can.
+
+    Add and Move ask exactly the same question, so they ask it in one place.
+    """
+    if parent["name"] == db.SYSTEM_LEAF:
+        return f"{db.SYSTEM_LEAF} is a system category — it cannot be given subcategories."
+    held = direct_txns(conn, parent["id"])
+    if held:
+        return (f"{parent['name']} has {plural(held, 'transaction', 'transactions')} — "
+                "move them to a subcategory or elsewhere first.")
+    return ""
+
+
+def category_add(conn):
+    name = request.form.get("name", "").strip()
+    if not name:
+        return "A category needs a name — nothing was added."
+    if name_taken(conn, name):
+        return f"There is already a category called {name} — nothing was added."
+    parent_id = None
+    raw = request.form.get("parent_id", "").strip()
+    if raw:
+        parent = category_row(conn, raw)
+        if parent is None:
+            return "That parent category no longer exists — nothing was added."
+        blocked = parent_block(conn, parent)
+        if blocked:
+            return blocked
+        parent_id = parent["id"]
+    conn.execute("INSERT INTO categories(name, parent_id) VALUES (?,?)", (name, parent_id))
+    conn.commit()
+    return f"Added {name}."
+
+
+def category_rename(conn):
+    node = category_row(conn, request.form.get("id"))
+    if node is None:
+        return "That category no longer exists — nothing was renamed."
+    if node["name"] == db.SYSTEM_LEAF:
+        return f"{db.SYSTEM_LEAF} is a system category — it cannot be renamed."
+    name = request.form.get("name", "").strip()
+    if not name:
+        return "A category needs a name — nothing was renamed."
+    if name == node["name"]:
+        return f"{name} already has that name — nothing was renamed."
+    if name_taken(conn, name):
+        return f"There is already a category called {name} — nothing was renamed."
+    conn.execute("UPDATE categories SET name=? WHERE id=?", (name, node["id"]))
+    conn.commit()
+    return f"Renamed {node['name']} to {name}."
+
+
+def category_move(conn):
+    node = category_row(conn, request.form.get("id"))
+    if node is None:
+        return "That category no longer exists — nothing was moved."
+    if node["name"] == db.SYSTEM_LEAF:
+        return f"{db.SYSTEM_LEAF} is a system category — it cannot be moved."
+    raw = request.form.get("parent_id", "").strip()
+    if not raw:
+        conn.execute("UPDATE categories SET parent_id=NULL WHERE id=?", (node["id"],))
+        conn.commit()
+        return f"Moved {node['name']} to the top level."
+    parent = category_row(conn, raw)
+    if parent is None:
+        return "That parent category no longer exists — nothing was moved."
+    if parent["id"] == node["id"]:
+        return f"{node['name']} cannot be its own parent — nothing was moved."
+    if db.is_descendant(conn, parent["id"], node["id"]):
+        return (f"{parent['name']} already sits under {node['name']} — that move "
+                "would make a loop, so nothing was moved.")
+    blocked = parent_block(conn, parent)
+    if blocked:
+        return blocked
+    conn.execute("UPDATE categories SET parent_id=? WHERE id=?", (parent["id"], node["id"]))
+    conn.commit()
+    return f"Moved {node['name']} under {parent['name']}."
+
+
+def category_delete(conn):
+    """Only a genuinely unused leaf goes. Anything pointing at it blocks."""
+    node = category_row(conn, request.form.get("id"))
+    if node is None:
+        return "That category no longer exists — nothing was deleted."
+    if node["name"] == db.SYSTEM_LEAF:
+        return f"{db.SYSTEM_LEAF} is a system category — it cannot be deleted."
+    kids = len(db.children(conn, node["id"]))
+    if kids:
+        return (f"{node['name']} has {plural(kids, 'subcategory', 'subcategories')} — "
+                "nothing was deleted.")
+    held = direct_txns(conn, node["id"])
+    if held:
+        return (f"{node['name']} has {plural(held, 'transaction', 'transactions')} — "
+                "nothing was deleted.")
+    rules = conn.execute(
+        "SELECT COUNT(*) n FROM merchant_rules WHERE category_id=?",
+        (node["id"],)).fetchone()["n"]
+    if rules:
+        return f"{node['name']} is used by a merchant rule — nothing was deleted."
+    try:
+        conn.execute("DELETE FROM categories WHERE id=?", (node["id"],))
+    except sqlite3.IntegrityError:
+        # The guards above cover everything M1 writes; a stub table (allocations)
+        # could still hold a reference in a later milestone. A refusal on this
+        # page is a sentence, never a stack trace.
+        conn.rollback()
+        return f"{node['name']} is still referenced — nothing was deleted."
+    conn.commit()
+    return f"Deleted {node['name']}."
+
+
+CATEGORY_ACTIONS = {"add": category_add, "rename": category_rename,
+                    "move": category_move, "delete": category_delete}
+
+TOP_LEVEL = "— top level —"
+
+
+def category_paths(conn):
+    """[(label, id)] for every category, by label. Built once per page."""
+    labels = db.category_labels(conn)
+    return sorted(((labels[r["id"]], r["id"])
+                   for r in conn.execute("SELECT id FROM categories")),
+                  key=lambda pair: pair[0])
+
+
+def parent_options(paths, exclude=None, selected=None):
+    """A <select> body of every category by path, for Add's and Move's parent.
+
+    Everything is offered, including a category that cannot take a child right
+    now: the refusal is a sentence the page shows, not an option quietly
+    missing from a list.
+    """
+    opts = f"<option value=''>{TOP_LEVEL}</option>"
+    for label, cid in paths:
+        if cid == exclude:
+            continue
+        opts += (f"<option value='{cid}'"
+                 f"{' selected' if cid == selected else ''}>{esc(label)}</option>")
+    return opts
+
+
+@app.route("/categories", methods=["GET", "POST"])
+def categories():
+    """The category tree: what it is, and the four ways to change it."""
+    conn = get_conn()
+
+    if request.method == "POST":
+        handler = CATEGORY_ACTIONS.get(request.form.get("action", ""))
+        msg = handler(conn) if handler else "Unknown action — nothing was changed."
+        return redirect(url_for("categories", msg=msg))
+
+    msg = request.args.get("msg", "")
+    note = f"<p class=sub><span class='status off'>{esc(msg)}</span></p>" if msg else ""
+
+    paths = category_paths(conn)
+    trs = ""
+    for node in db.category_tree(conn):
+        locked = node["name"] == db.SYSTEM_LEAF
+        # The settled green is reserved for reviewed/reconciled state, so the
+        # tree marks structure quietly: a heading is called out, a leaf is the
+        # ordinary case and reads as muted text.
+        kind = ("<span class=meta>Leaf</span>" if node["is_leaf"]
+                else "<span class='pill b'>Heading</span>")
+        indent = f"padding-left:{node['depth'] * 18}px"
+        # A heading holding transactions is not reachable through this page —
+        # it is shown rather than hidden so an odd book is visible.
+        held = node["direct_txn_count"]
+        if locked:
+            actions = ("<td colspan=3 class=meta>System category — it is where "
+                       "anything unresolved lands, so it stays exactly as it is.</td>")
+        else:
+            actions = (
+                "<td><form method=post>"
+                "<input type=hidden name=action value=rename>"
+                f"<input type=hidden name=id value={node['id']}>"
+                f"<input type=text name=name value=\"{esc(node['name'])}\" "
+                "aria-label='New name'>"
+                "<button class='btn ghost'>Rename</button></form></td>"
+                "<td><form method=post>"
+                "<input type=hidden name=action value=move>"
+                f"<input type=hidden name=id value={node['id']}>"
+                "<select name=parent_id aria-label='New parent'>"
+                f"{parent_options(paths, exclude=node['id'], selected=node['parent_id'])}"
+                "</select>"
+                "<button class='btn ghost'>Move</button></form></td>"
+                "<td><form method=post>"
+                "<input type=hidden name=action value=delete>"
+                f"<input type=hidden name=id value={node['id']}>"
+                "<button class='btn danger'>Delete</button></form></td>")
+        trs += (f"<tr><td><span style='{indent}'>{esc(node['name'])}</span></td>"
+                f"<td>{kind}</td><td class='r num'>{held}</td>"
+                f"<td class='r num'>{node['child_count']}</td>{actions}</tr>")
+
+    body = f"""<h1>Categories</h1>
+      <p class=sub>Transactions are filed on the leaves. A category with
+      subcategories is a heading — its total is the sum of what sits under it,
+      and nothing is ever filed on it directly. Which is why a category holding
+      transactions cannot be given a subcategory until those rows are moved.</p>
+      {note}
+      <form method=post class=field>
+        <input type=hidden name=action value=add>
+        <span><label class=lbl>New category</label>
+          <input type=text name=name aria-label='New category name'></span>
+        <span><label class=lbl>Inside</label>
+          <select name=parent_id aria-label='Parent category'>
+            {parent_options(paths)}</select></span>
+        <button class=btn>Add</button>
+      </form>
+      <table><tr><th>Category</th><th>Type</th><th class=r>Transactions</th>
+        <th class=r>Subcategories</th><th>Rename</th><th>Move</th><th>Delete</th></tr>
+        {trs}</table>"""
+    return page(body, "cats")
 
 
 def normalize_date(raw):

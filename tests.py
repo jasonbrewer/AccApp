@@ -1159,8 +1159,13 @@ f"data-id='{grid_id}'" in grid_html or fail("rows should expose data-id for the 
 
 start = grid_html.index('id="cat-list">') + len('id="cat-list">')
 embedded = J.loads(grid_html[start:grid_html.index("</script>", start)])
-embedded == D.category_names(conn) or fail(
-    "the embedded category list should be exactly the active category names")
+# Leaves only, each {name, label}: the name is the wire value, the label is the
+# path it displays as. The seeds are flat, so every label is still a bare name.
+leaves = [{"name": c["name"], "label": c["label"]} for c in D.leaf_choices(conn)]
+embedded == leaves or fail(
+    "the embedded category list should be exactly the assignable leaves")
+embedded == [{"name": n, "label": n} for n in D.category_names(conn)] or fail(
+    "with a flat seed tree every leaf label should still be its bare name")
 
 # ...and the read-only columns carry no edit hook
 grid_row = grid_html[grid_html.index(f"data-id='{grid_id}'"):]
@@ -1187,7 +1192,8 @@ hostile = client.get("/transactions").data.decode()
 start = hostile.index('id="cat-list">') + len('id="cat-list">')
 block = hostile[start:hostile.index("</script>", start)]
 "<" not in block or fail("a raw < inside the embedded JSON could end the script early")
-J.loads(block) == D.category_names(conn) or fail(
+J.loads(block) == [{"name": c["name"], "label": c["label"]}
+                   for c in D.leaf_choices(conn)] or fail(
     "the embedded category JSON stopped parsing")
 
 # every <script> the page opens is closed exactly once — the note didn't add one
@@ -2081,7 +2087,7 @@ SCHEMA = {
     "accounts": {"id", "name", "kind", "default_use", "created_at"},
     "allocations": {"id", "txn_id", "category_id", "use", "amount_cents"},
     "attachments": {"id", "document_id", "txn_id", "confirmed_by_user"},
-    "categories": {"id", "name", "kind", "use_default", "active"},
+    "categories": {"id", "name", "kind", "use_default", "active", "parent_id"},
     "documents": {"id", "filename", "sha256", "stored_path", "imported_at"},
     "import_batches": {"id", "account_id", "filename", "imported_at", "row_count",
                        "dup_count", "source_path"},
@@ -2326,6 +2332,373 @@ for folder in TEMP_DIRS:
     for leaf in os.listdir(folder) if os.path.isdir(folder) else []:
         os.remove(os.path.join(folder, leaf))
     os.path.isdir(folder) and os.rmdir(folder)
+
+# ---------------------------------------------------------------------------
+# 30A-30K. The nested category tree. A category may have a parent; one with
+# children is a HEADING and one without is a LEAF, and ONLY leaves are ever
+# assigned to a transaction or a merchant rule — a heading's total is the sum
+# of what sits under it. Names stay globally unique, so every wire contract
+# still passes a category by NAME and only the DISPLAY learned the path.
+# ---------------------------------------------------------------------------
+
+CODES = []                      # every status code this section produced
+
+
+def cat_post(**form):
+    r = client.post("/categories", data=form, follow_redirects=True)
+    CODES.append(r.status_code)
+    return r.data.decode()
+
+
+def cat_id(name):
+    row = conn.execute("SELECT id FROM categories WHERE name=?", (name,)).fetchone()
+    return row["id"] if row else None
+
+
+def add_cat(name, parent=None):
+    return cat_post(action="add", name=name,
+                    parent_id="" if parent is None else str(cat_id(parent)))
+
+
+def parent_of(name):
+    return conn.execute("SELECT parent_id FROM categories WHERE name=?",
+                        (name,)).fetchone()["parent_id"]
+
+
+def held_by(name):
+    return conn.execute("SELECT COUNT(*) n FROM transactions WHERE category_id=?",
+                        (cat_id(name),)).fetchone()["n"]
+
+
+def leaf_names():
+    return [c["name"] for c in D.leaf_choices(conn)]
+
+
+def leaf_labels():
+    return [c["label"] for c in D.leaf_choices(conn)]
+
+
+rules_before_tree = rules_count()
+
+# 30A. the schema change: ONE nullable column on categories, nothing else.
+info = {r[1]: r for r in conn.execute("PRAGMA table_info(categories)")}
+"parent_id" in info or fail("categories should have a parent_id column")
+info["parent_id"][2].upper() == "INTEGER" or fail("parent_id should be INTEGER")
+info["parent_id"][3] == 0 or fail("parent_id must be nullable — NULL is top level")
+info["parent_id"][4] is None or fail("parent_id must have no default")
+[(r[2], r[3], r[4]) for r in conn.execute("PRAGMA foreign_key_list(categories)")] == \
+    [("categories", "parent_id", "id")] or fail(
+    "parent_id should be the one foreign key on categories, pointing at categories(id)")
+# UNIQUE(name) is untouched: names stay globally unique whatever the tree does
+uniques = [r["name"] for r in conn.execute("PRAGMA index_list(categories)") if r["unique"]]
+[tuple(x[2] for x in conn.execute(f"PRAGMA index_info('{u}')")) for u in uniques].count(
+    ("name",)) == 1 or fail("categories.name must still carry exactly one UNIQUE index")
+# ...and every other table is exactly what it was (SCHEMA is 29A's snapshot)
+live = {r["name"]: {c[1] for c in conn.execute(f"PRAGMA table_info({r['name']})")}
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+live == SCHEMA or fail(f"this PR is one additive column, not this: {live}")
+
+# a fresh file gets the column from init_db — no ALTER, no migration step
+FRESH = "_test_tree.sqlite"
+os.path.exists(FRESH) and os.remove(FRESH)
+fresh = D.init_db(FRESH)
+{c[1] for c in fresh.execute("PRAGMA table_info(categories)")} == SCHEMA["categories"] \
+    or fail("init_db does not create parent_id on a fresh file")
+# the seed set is UNCHANGED, and every seed is still a flat top-level LEAF
+{n for n, _, _ in D.SEED_CATEGORIES} == {
+    "Equipment", "Software & Subscriptions", "Office Supplies",
+    "Advertising & Marketing", "Professional Services", "Shipping", "Office Rent",
+    "Meals", "Travel", "Gas / Vehicle", "Utilities / Phone", "Insurance",
+    "Groceries", "Dining", "Household", "Entertainment", "Health",
+    "Mortgage / Rent", "Shopping", "Pets", "Income", "Transfer",
+    "Uncategorized"} or fail("the seed categories changed — trimming them is a later PR")
+len(D.SEED_RULES) == 6 or fail("the seed rules changed")
+fresh.execute("SELECT COUNT(*) n FROM categories WHERE parent_id IS NOT NULL"
+              ).fetchone()["n"] == 0 or fail("every seeded category must be top level")
+all(c["label"] == c["name"] for c in D.leaf_choices(fresh)) or fail(
+    "with a flat seed tree every label is still the bare name")
+{c["name"] for c in D.leaf_choices(fresh)} == {n for n, _, _ in D.SEED_CATEGORIES} or fail(
+    "every seeded category should be an assignable leaf on a fresh book")
+fresh.close()
+os.remove(FRESH)
+
+# 30B. the helpers, on a small tree: A with children 1, 2, 3 and 2 with child 2a
+add_cat("Tree A")
+for kid in ("Tree 1", "Tree 2", "Tree 3"):
+    add_cat(kid, "Tree A")
+add_cat("Tree 2a", "Tree 2")
+for name in ("Tree A", "Tree 1", "Tree 2", "Tree 3", "Tree 2a"):
+    cat_id(name) or fail(f"{name} should have been created")
+
+D.is_leaf(conn, cat_id("Tree A")) is False or fail("a category with children is a heading")
+D.is_leaf(conn, cat_id("Tree 2")) is False or fail("Tree 2 has a child, so it is a heading")
+D.is_leaf(conn, cat_id("Tree 2a")) is True or fail("Tree 2a has no children, so it is a leaf")
+[r["name"] for r in D.children(conn, cat_id("Tree A"))] == ["Tree 1", "Tree 2", "Tree 3"] \
+    or fail("children() should return the direct children, by name")
+D.children(conn, cat_id("Tree 2a")) == [] or fail("a leaf has no children")
+
+labels = D.category_labels(conn)
+labels[cat_id("Tree 2a")] == "Tree A › Tree 2 › Tree 2a" or fail(
+    f"the full path is wrong: {labels[cat_id('Tree 2a')]!r}")
+labels[cat_id("Tree 1")] == "Tree A › Tree 1" or fail("a one-deep path is A > B")
+labels[cat_id("Tree A")] == "Tree A" or fail("a top-level category labels as its own name")
+labels[cat_id("Uncategorized")] == "Uncategorized" or fail(
+    "Uncategorized's label is just Uncategorized")
+
+# leaf_choices is LEAVES ONLY, sorted by label, and every entry carries both
+"Tree A" in leaf_names() and fail("a heading must never be offered as a choice")
+"Tree 2" in leaf_names() and fail("Tree 2 is a heading now — not a choice")
+"Tree A › Tree 2 › Tree 2a" in leaf_labels() or fail(
+    "a nested leaf should be offered by its full path")
+for want in ("Tree A › Tree 1", "Tree A › Tree 3"):
+    want in leaf_labels() or fail(f"{want} should be an assignable leaf")
+leaf_labels() == sorted(leaf_labels()) or fail("leaf_choices should be sorted by label")
+all(set(c) == {"id", "name", "label"} for c in D.leaf_choices(conn)) or fail(
+    "each choice is {id, name, label}")
+
+# is_descendant, both ways round and not reflexive
+D.is_descendant(conn, cat_id("Tree 2a"), cat_id("Tree A")) or fail(
+    "Tree 2a sits under Tree A")
+D.is_descendant(conn, cat_id("Tree 2a"), cat_id("Tree 2")) or fail(
+    "Tree 2a sits under Tree 2")
+D.is_descendant(conn, cat_id("Tree A"), cat_id("Tree 2a")) and fail(
+    "Tree A is not under its own grandchild")
+D.is_descendant(conn, cat_id("Tree A"), cat_id("Tree A")) and fail(
+    "a category is not its own descendant")
+
+# category_tree: depth-first, with the counts the page renders
+tree = {n["name"]: n for n in D.category_tree(conn)}
+tree["Tree A"]["depth"] == 0 or fail("Tree A is top level")
+tree["Tree 2"]["depth"] == 1 or fail("Tree 2 sits one deep")
+tree["Tree 2a"]["depth"] == 2 or fail("Tree 2a sits two deep")
+tree["Tree A"]["child_count"] == 3 or fail("Tree A has three children")
+tree["Tree A"]["is_leaf"] is False or fail("Tree A is a heading")
+tree["Tree 2a"]["is_leaf"] is True or fail("Tree 2a is a leaf")
+order = [n["name"] for n in D.category_tree(conn)]
+order.index("Tree 2a") == order.index("Tree 2") + 1 or fail(
+    "the tree should come back depth-first: a child follows its parent")
+D.resolve_leaf(conn, "Tree 2a") == cat_id("Tree 2a") or fail("a leaf resolves to its id")
+D.resolve_leaf(conn, "Tree A") is None or fail("a heading is not assignable")
+D.resolve_leaf(conn, "No Such Category") is None or fail("an unknown name is not assignable")
+
+# 30C. THE MARQUEE TEST — a category holding transactions cannot be given a
+# child. The rows would sit outside every child and stop adding up.
+spare = [r["id"] for r in conn.execute(
+    "SELECT id FROM transactions ORDER BY id LIMIT 2")]
+bulk(ids=spare, action="category", value="Meals")
+for tid in spare:
+    txn(tid)["catname"] == "Meals" or fail("the fixture rows should be filed on Meals")
+held = held_by("Meals")
+held >= 2 or fail("Meals should be holding the fixture transactions")
+want = (f"Meals has {held} transactions — move them to a subcategory "
+        "or elsewhere first.")
+
+before = {r["id"] for r in conn.execute("SELECT id FROM categories")}
+html = add_cat("Meals Out", "Meals")
+want in html or fail(f"the block should say exactly: {want!r}")
+cat_id("Meals Out") is None or fail("the blocked child must not have been created")
+{r["id"] for r in conn.execute("SELECT id FROM categories")} == before or fail(
+    "a blocked add must write nothing at all")
+held_by("Meals") == held or fail("a blocked add must leave the transactions alone")
+for tid in spare:
+    txn(tid)["catname"] == "Meals" or fail("a blocked add must not touch a transaction")
+
+# ...and a MOVE onto that same category is the same question, so the same block
+html = cat_post(action="move", id=str(cat_id("Tree 3")), parent_id=str(cat_id("Meals")))
+want in html or fail("moving a category under one holding transactions must block too")
+parent_of("Tree 3") == cat_id("Tree A") or fail("a blocked move must not move anything")
+
+# 30D. once the rows are moved, Meals can become a heading — and the moment it
+# does it stops being assignable, in every picker and on every route.
+stuck = [r["id"] for r in conn.execute(
+    "SELECT id FROM transactions WHERE category_id=?", (cat_id("Meals"),))]
+bulk(ids=stuck, action="category", value="Tree 1")
+held_by("Meals") == 0 or fail("the transactions should have moved to Tree 1")
+html = add_cat("Meals Out", "Meals")
+"Added Meals Out." in html or fail("an empty category should accept a child")
+parent_of("Meals Out") == cat_id("Meals") or fail("Meals Out should sit under Meals")
+
+"Meals" in leaf_names() and fail("Meals is a heading now — it must leave every picker")
+"Meals Out" in leaf_names() or fail("the new child is the assignable leaf")
+"Meals › Meals Out" in leaf_labels() or fail("the child is offered by its path")
+D.resolve_leaf(conn, "Meals") is None or fail("the heading's name is not assignable")
+
+# posting the HEADING's name lands on Uncategorized — never on the heading
+victim = spare[0]
+r = update(id=victim, category="Meals")
+CODES.append(r.status_code)
+txn(victim)["catname"] == "Uncategorized" or fail(
+    "a heading posted to /transactions/update must fall back to Uncategorized")
+J.loads(r.data)["category"] == "Uncategorized" or fail(
+    "the grid reply should say Uncategorized, not Meals")
+r = bulk(ids=spare, action="category", value="Meals")
+CODES.append(r.status_code)
+for tid in spare:
+    txn(tid)["catname"] == "Uncategorized" or fail(
+        "a heading posted to /transactions/bulk must fall back to Uncategorized")
+conn.execute("SELECT COUNT(*) n FROM transactions WHERE category_id=?",
+             (cat_id("Meals"),)).fetchone()["n"] == 0 or fail(
+    "nothing may ever be stored on a heading")
+
+# the pickers themselves: leaves only, by path, on every surface
+grid_html = client.get("/transactions").data.decode()
+CODES.append(200)
+start = grid_html.index('id="cat-list">') + len('id="cat-list">')
+embedded = J.loads(grid_html[start:grid_html.index("</script>", start)])
+embedded == [{"name": c["name"], "label": c["label"]} for c in D.leaf_choices(conn)] \
+    or fail("the grid's embedded list should be leaf_choices()")
+{c["name"] for c in embedded}.isdisjoint({"Meals", "Tree A", "Tree 2"}) or fail(
+    "no heading may appear in the grid's category list")
+{"name": "Meals Out", "label": "Meals › Meals Out"} in embedded or fail(
+    "the grid should offer the nested leaf by its path")
+'<option value="Meals Out">Meals › Meals Out</option>' in grid_html or fail(
+    "the bulk select should send the name and show the path")
+'<option value="Meals">' in grid_html and fail("the bulk select must not offer a heading")
+
+cat_html = client.get("/categorize").data.decode()
+CODES.append(200)
+'<option value="Meals Out">Meals › Meals Out</option>' in cat_html or fail(
+    "the categorize pickers should render leaves by path")
+'<option value="Meals">' in cat_html and fail("categorize must not offer a heading")
+rev_html = client.get("/review").data.decode()
+CODES.append(200)
+if "<select" in rev_html:            # only when something is left to review
+    '<option value="Meals">' in rev_html and fail("review must not offer a heading")
+
+# 30E. the cycle guard: a category can never be moved under its own descendant
+html = cat_post(action="move", id=str(cat_id("Tree A")), parent_id=str(cat_id("Tree 2a")))
+"would make a loop" in html or fail("moving A under its own descendant must be refused")
+parent_of("Tree A") is None or fail("a refused move must leave the parent alone")
+html = cat_post(action="move", id=str(cat_id("Tree A")), parent_id=str(cat_id("Tree A")))
+"cannot be its own parent" in html or fail("a category cannot be its own parent")
+parent_of("Tree A") is None or fail("a refused move must leave the parent alone")
+# ...and a legitimate move still works, both ways
+html = cat_post(action="move", id=str(cat_id("Tree 3")), parent_id=str(cat_id("Tree 2")))
+"Moved Tree 3 under Tree 2." in html or fail("a legitimate move should be allowed")
+parent_of("Tree 3") == cat_id("Tree 2") or fail("Tree 3 should now sit under Tree 2")
+html = cat_post(action="move", id=str(cat_id("Tree 3")), parent_id="")
+"Moved Tree 3 to the top level." in html or fail("a category can go back to the top")
+parent_of("Tree 3") is None or fail("Tree 3 should be top level again")
+
+# 30F. delete guards: only a genuinely unused leaf goes
+html = cat_post(action="delete", id=str(cat_id("Tree A")))
+"has 2 subcategories" in html or fail("deleting a heading should name its children")
+cat_id("Tree A") or fail("a blocked delete must not delete anything")
+occupied = held_by("Tree 1")
+occupied >= 1 or fail("Tree 1 should be holding the moved transactions")
+plural = "transaction" if occupied == 1 else "transactions"
+html = cat_post(action="delete", id=str(cat_id("Tree 1")))
+f"has {occupied} {plural}" in html or fail("deleting a full leaf should name the rows")
+cat_id("Tree 1") or fail("a blocked delete must not delete anything")
+
+add_cat("Tree Ruled")
+conn.execute("INSERT INTO merchant_rules(merchant_norm, category_id, updated_at) "
+             "VALUES (?,?,?)", ("TREE RULED", cat_id("Tree Ruled"), "2026-01-01"))
+conn.commit()
+html = cat_post(action="delete", id=str(cat_id("Tree Ruled")))
+"is used by a merchant rule" in html or fail("a category behind a rule cannot be deleted")
+cat_id("Tree Ruled") or fail("a blocked delete must not delete anything")
+conn.execute("DELETE FROM merchant_rules WHERE merchant_norm='TREE RULED'")
+conn.commit()
+
+# a clean, unused leaf really does go
+add_cat("Tree Spare")
+html = cat_post(action="delete", id=str(cat_id("Tree Spare")))
+"Deleted Tree Spare." in html or fail("an unused leaf should delete")
+cat_id("Tree Spare") is None or fail("the unused leaf should be gone")
+html = cat_post(action="delete", id=str(cat_id("Tree Ruled")))
+"Deleted Tree Ruled." in html or fail("the leaf should delete once its rule is gone")
+
+# 30G. Uncategorized is a system leaf: never renamed, moved, deleted, or a parent
+unc = cat_id("Uncategorized")
+for form in ({"action": "rename", "id": str(unc), "name": "Misc"},
+             {"action": "move", "id": str(unc), "parent_id": str(cat_id("Tree A"))},
+             {"action": "delete", "id": str(unc)}):
+    html = cat_post(**form)
+    "system category" in html or fail(f"Uncategorized must refuse {form['action']}")
+cat_id("Uncategorized") == unc or fail("Uncategorized must still be there, by name")
+parent_of("Uncategorized") is None or fail("Uncategorized must still be top level")
+html = add_cat("Tree Orphan", "Uncategorized")
+"cannot be given subcategories" in html or fail("Uncategorized can never be a heading")
+cat_id("Tree Orphan") is None or fail("the blocked child must not exist")
+html = cat_post(action="move", id=str(cat_id("Tree 3")), parent_id=str(unc))
+"cannot be given subcategories" in html or fail("nothing can be moved under Uncategorized")
+D.is_leaf(conn, unc) or fail("Uncategorized must still be a leaf")
+"Uncategorized" in leaf_names() or fail("Uncategorized stays assignable — it is the fallback")
+
+# 30H. display is the PATH, everywhere a category is shown
+nested = conn.execute(
+    "SELECT id FROM transactions WHERE category_id=? LIMIT 1", (cat_id("Tree 1"),)
+).fetchone()["id"]
+grid_html = client.get("/transactions").data.decode()
+CODES.append(200)
+row = grid_html[grid_html.index(f"data-id='{nested}'"):]
+row = row[:row.index("</tr>")]
+"Tree A › Tree 1" in row or fail("the grid cell should show the full path")
+'data-category="Tree A › Tree 1"' in row or fail(
+    "the row's data-category should carry the path the cell shows")
+"Tree A › Tree 1" in client.get("/categorize").data.decode() or fail(
+    "the categorize Now column should show the full path")
+r = update(id=nested, note="tree display")
+CODES.append(r.status_code)
+J.loads(r.data)["category"] == "Tree A › Tree 1" or fail(
+    "the grid update reply should return the path label for display")
+
+# 30I. NO TEACHING REGRESSIONS — not one merchant rule came out of any of this
+rules_count() == rules_before_tree or fail(
+    "nothing in the tree work — /categories, the grid, or bulk — may teach a rule")
+src = io.open("app.py", encoding="utf-8").read()
+for fn in ("categories", "category_add", "category_rename", "category_move",
+           "category_delete", "parent_block"):
+    block = src[src.index(f"def {fn}("):]
+    block = block[:block.index("\ndef ", 1)]
+    "teach_merchant_rule" not in block or fail(f"{fn} must never teach a merchant rule")
+    for banned in ("<script", "onclick", "addEventListener", "fetch("):
+        banned not in block or fail(f"{fn} should need no JavaScript ({banned})")
+
+# 30J. the management page renders the tree it describes
+page_html = client.get("/categories").data.decode()
+CODES.append(200)
+for want in ("Tree A", "Tree 2a", ">Leaf<", ">Heading<",
+             'name=action value=add', 'name=action value=rename',
+             'name=action value=move', 'name=action value=delete'):
+    want in page_html or fail(f"the categories page is missing {want!r}")
+# the page is plain server forms: the ONE script block is the base template's
+# grid editor, which every page has always carried and which does nothing here.
+page_html.count("<script") == 1 or fail(
+    "the categories page adds JavaScript of its own")
+page_body = page_html[page_html.index("<h1>Categories</h1>"):page_html.index("<script")]
+for banned in ("onclick", "onchange", "onsubmit", "addEventListener", "fetch("):
+    banned not in page_body or fail(
+        f"the categories page must contain no {banned!r}")
+# names are escaped wherever they land
+add_cat('Tree <b>"hostile"</b>')
+page_html = client.get("/categories").data.decode()
+CODES.append(200)
+"<b>hostile" not in page_html or fail("a category name with markup reached the page raw")
+"Tree &lt;b&gt;" in page_html or fail("a category name with markup should render escaped")
+cat_post(action="delete", id=str(cat_id('Tree <b>"hostile"</b>')))
+
+# 30K. every sad path was a rendered note, never a 500 — and the whole app
+# still renders with a heading in the tree
+for path in ("/", "/transactions", "/categorize", "/review", "/categories", "/import"):
+    CODES.append(client.get(path).status_code)
+for bad in ({"action": "add", "name": "   "},
+            {"action": "add", "name": "Meals"},
+            {"action": "add", "name": "Fine", "parent_id": "999999"},
+            {"action": "rename", "id": "999999", "name": "Nope"},
+            {"action": "rename", "id": str(cat_id("Tree 2")), "name": "Travel"},
+            {"action": "rename", "id": "not-a-number", "name": "Nope"},
+            {"action": "move", "id": str(cat_id("Tree 2")), "parent_id": "999999"},
+            {"action": "delete", "id": "999999"},
+            {"action": "sabotage", "id": "1"},
+            {}):
+    html = cat_post(**bad)
+    "nothing was" in html or "Unknown action" in html or "already" in html or fail(
+        f"a refused action should render a note: {bad}")
+cat_id("Fine") is None or fail("a child of a missing parent must not be created")
+set(CODES) == {200} or fail(f"a category route errored: {sorted(set(CODES))}")
+
 
 os.remove("_test.sqlite")
 for leftover in (PROFILES, PROFILES + ".tmp"):
