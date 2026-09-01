@@ -774,7 +774,7 @@ def cells(description):
     """The two money cells of the row whose description matches."""
     at = page_html.index(description)
     row = page_html[at:page_html.index("</tr>", at)]
-    return re.findall(r"<td class='r num'>([^<]*)</td>", row)
+    return re.findall(r"<td class='r num ed'[^>]*>([^<]*)</td>", row)
 
 
 cells("DEBITSIDE RENT") == ["-$337.00", ""] or fail(
@@ -789,7 +789,10 @@ def rendered_rows(query=""):
     body = r.data.decode()
     body = body[body.index("<table id="):]
     # rows now carry data-* hooks for the inline editor
-    return re.findall(r"<tr data-id='\d+'[^>]*><td>(\d{4}-\d{2}-\d{2})</td><td>(.*?)</td>", body)
+    return re.findall(
+        r"<tr data-id='\d+'[^>]*>"
+        r"<td class='ed' data-field='date' tabindex='0'>(\d{4}-\d{2}-\d{2})</td>"
+        r"<td class='ed' data-field='description' tabindex='0'>(.*?)</td>", body)
 
 
 def rendered_cents(query=""):
@@ -798,7 +801,8 @@ def rendered_cents(query=""):
     body = r.data.decode()
     out = []
     for money_cells in re.findall(
-            r"<td class='r num'>([^<]*)</td><td class='r num'>([^<]*)</td>", body):
+            r"<td class='r num ed'[^>]*>([^<]*)</td><td class='r num ed'[^>]*>([^<]*)</td>",
+            body):
         shown = money_cells[0] or money_cells[1]
         out.append(shown)
     return out
@@ -982,11 +986,12 @@ embedded == D.category_names(conn) or fail(
 # ...and the read-only columns carry no edit hook
 grid_row = grid_html[grid_html.index(f"data-id='{grid_id}'"):]
 grid_row = grid_row[:grid_row.index("</tr>")]
-editable = grid_row.count("class='ed'")
-editable == 3 or fail(
-    f"exactly three cells are editable in this PR (category/use/note), found {editable}")
-"<td class='r num'>-$42.00</td>" in grid_row or fail(
-    "the debit cell should still render read-only")
+editable = grid_row.count("data-field=")
+editable == 7 or fail(
+    "date/description/category/use/note/debit/credit should all be editable, "
+    f"found {editable}")
+"<td class='status'>" in grid_row or fail("Status stays read-only")
+"-$42.00" in grid_row or fail("the debit cell should still show the amount")
 
 # 25I. injection guard: a note full of markup can't break the page or the JSON
 nasty = '</script><script>alert(1)</script> "quoted" & <b>bold</b>'
@@ -1019,6 +1024,203 @@ J.loads(A.script_json(["Meals", "</script> & <b>"])) == ["Meals", "</script> & <
 # 25K. and the whole no-teach promise, stated once more over every edit above
 rules_count() == before_rules or fail(
     "some edit on the transactions grid taught a merchant rule")
+
+# 26. transactions grid: editing the identity columns — date, amount, description
+#
+# The safety property of this section: dedup_key is FROZEN. It is what makes a
+# re-imported statement skip rows you already have, so correcting a typo in an
+# amount must leave it byte-identical.
+conn.execute(
+    """INSERT INTO transactions
+       (account_id, txn_date, description, merchant_norm, amount_cents,
+        dedup_key, created_at, note)
+       VALUES (1,'2026-08-01','IDENTITY EDIT CO','IDENTITY EDIT',
+               -1999,'identity-edit-1','now','keep me')""")
+conn.commit()
+ident = conn.execute(
+    "SELECT id FROM transactions WHERE dedup_key='identity-edit-1'").fetchone()["id"]
+
+
+def frozen_key(tid):
+    return conn.execute(
+        "SELECT dedup_key FROM transactions WHERE id=?", (tid,)).fetchone()["dedup_key"]
+
+
+def unchanged_by(tid, **form):
+    """Post an edit and hand back (dedup_key before, dedup_key after)."""
+    before = frozen_key(tid)
+    update(id=tid, **form)
+    return before, frozen_key(tid)
+
+
+# 26A. an amount edit: magnitude from the text, sign from the side
+conn.execute("UPDATE transactions SET reviewed=0 WHERE id=?", (ident,))
+conn.commit()
+key_before = frozen_key(ident)
+rules_before_identity = rules_count()
+
+out = J.loads(update(id=ident, amount="50.00", side="debit").data)
+out["amount_cents"] == -5000 or fail(f"debit 50.00 should be -5000, got {out['amount_cents']}")
+txn(ident)["amount_cents"] == -5000 or fail("the amount edit was not stored")
+isinstance(txn(ident)["amount_cents"], int) or fail("amount_cents must stay an integer")
+frozen_key(ident) == key_before or fail(
+    "an amount edit rewrote dedup_key — it must be frozen at import")
+txn(ident)["reviewed"] == 0 or fail("an amount edit must not mark the row reviewed")
+
+# side flips the sign, magnitude is taken as an absolute value either way
+J.loads(update(id=ident, amount="50.00", side="credit").data)["amount_cents"] == 5000 \
+    or fail("credit 50.00 should be +5000")
+J.loads(update(id=ident, amount="-50.00", side="credit").data)["amount_cents"] == 5000 \
+    or fail("a typed minus sign must not beat the chosen side")
+J.loads(update(id=ident, amount="$1,234.56", side="debit").data)["amount_cents"] == -123456 \
+    or fail("$1,234.56 as a debit should be -123456")
+J.loads(update(id=ident, amount="0", side="debit").data)["amount_cents"] == 0 \
+    or fail("a zero amount is allowed and stores 0")
+
+# 26B. an unreadable amount, or a side that isn't a column, is a 400 that
+#      writes nothing
+for bad in ({"amount": "abc", "side": "debit"},
+            {"amount": "", "side": "debit"},
+            {"amount": "12.00", "side": "sideways"},
+            {"amount": "12.00"}):                 # side is not optional
+    snapshot = (txn(ident)["amount_cents"], frozen_key(ident))
+    r = client.post("/transactions/update", data=dict(bad, id=ident))
+    r.status_code == 400 or fail(f"{bad} should be 400, got {r.status_code}")
+    J.loads(r.data)["ok"] is False or fail(f"{bad} should answer ok:false")
+    (txn(ident)["amount_cents"], frozen_key(ident)) == snapshot or fail(
+        f"a rejected amount ({bad}) still wrote something")
+
+# 26C. dates go through normalize_date, in either notation
+for typed in ("01/15/2026", "2026-01-15"):
+    before, after = unchanged_by(ident, date=typed)
+    txn(ident)["txn_date"] == "2026-01-15" or fail(
+        f"{typed} should normalize to 2026-01-15, got {txn(ident)['txn_date']}")
+    before == after or fail("a date edit rewrote dedup_key")
+txn(ident)["reviewed"] == 0 or fail("a date edit must not mark the row reviewed")
+
+snapshot = (txn(ident)["txn_date"], frozen_key(ident))
+r = client.post("/transactions/update", data={"id": ident, "date": "someday"})
+r.status_code == 400 or fail(f"an unreadable date should be 400, got {r.status_code}")
+J.loads(r.data)["ok"] is False or fail("an unreadable date should answer ok:false")
+(txn(ident)["txn_date"], frozen_key(ident)) == snapshot or fail(
+    "a rejected date still wrote something")
+
+# 26D. a description edit also recomputes merchant_norm — a matching key, not
+#      an identity — and still teaches nothing
+new_desc = "SQ *CIRCLE K #482 0834"
+before, after = unchanged_by(ident, description=new_desc)
+row = txn(ident)
+row["description"] == new_desc or fail("the description edit was not stored")
+row["merchant_norm"] == A.normalize_merchant(new_desc) or fail(
+    f"merchant_norm should follow the description, got {row['merchant_norm']}")
+before == after or fail("a description edit rewrote dedup_key")
+row["reviewed"] == 0 or fail("a description edit must not mark the row reviewed")
+rules_count() == rules_before_identity or fail(
+    "recomputing merchant_norm taught a merchant rule — the grid must never teach")
+
+# a description is trimmed, and cannot be blanked
+update(id=ident, description="   PADDED NAME   ")
+txn(ident)["description"] == "PADDED NAME" or fail("a description should be stored trimmed")
+for blank in ("", "   "):
+    snapshot = (txn(ident)["description"], txn(ident)["merchant_norm"], frozen_key(ident))
+    r = client.post("/transactions/update", data={"id": ident, "description": blank})
+    r.status_code == 400 or fail(f"a blank description should be 400, got {r.status_code}")
+    (txn(ident)["description"], txn(ident)["merchant_norm"],
+     frozen_key(ident)) == snapshot or fail("a rejected description still wrote something")
+
+# 26E. one bad field rejects the whole request — no half-applied row
+snapshot = (txn(ident)["description"], txn(ident)["txn_date"], txn(ident)["note"])
+r = client.post("/transactions/update", data={
+    "id": ident, "description": "SHOULD NOT LAND", "note": "nor this",
+    "date": "not a date"})
+r.status_code == 400 or fail("a request with one bad field should be 400")
+(txn(ident)["description"], txn(ident)["txn_date"],
+ txn(ident)["note"]) == snapshot or fail(
+    "a rejected request applied its other fields — it must be all or nothing")
+
+# ...and the same when the bad field is the LAST one evaluated, so a field
+# validated earlier can't have been written on the way past
+snapshot = (txn(ident)["note"], txn(ident)["txn_date"])
+r = client.post("/transactions/update", data={
+    "id": ident, "note": "landed?", "date": "01/01/2026", "description": ""})
+r.status_code == 400 or fail("a trailing bad field should still be 400")
+(txn(ident)["note"], txn(ident)["txn_date"]) == snapshot or fail(
+    "fields validated before the bad one were written anyway")
+
+# 26F. the reply carries the display strings, formatted server-side by money()
+out = J.loads(update(id=ident, amount="12.50", side="debit").data)
+(out["debit"], out["credit"]) == ("-$12.50", "") or fail(
+    f"a debit should format as (-$12.50, ''), got {(out['debit'], out['credit'])}")
+out = J.loads(update(id=ident, amount="12.50", side="credit").data)
+(out["debit"], out["credit"]) == ("", "$12.50") or fail(
+    f"a credit should format as ('', $12.50), got {(out['debit'], out['credit'])}")
+out = J.loads(update(id=ident, amount="0", side="debit").data)
+(out["debit"], out["credit"]) == ("", "") or fail(
+    f"zero belongs in neither column, got {(out['debit'], out['credit'])}")
+out["date"] == txn(ident)["txn_date"] or fail("the reply should carry the stored date")
+out["description"] == txn(ident)["description"] or fail(
+    "the reply should carry the stored description")
+
+# 26G. THE MARQUEE TEST — edit an imported row, then re-import the same file.
+#      The frozen key still matches, so the row is skipped and keeps the edit.
+FREEZE_CSV = ("Date,Description,Amount\n"
+              "07/04/2026,FROZEN KEY DINER,-31.40\n"
+              "07/05/2026,FROZEN KEY FUEL,-52.10\n")
+import_csv(FREEZE_CSV, "freeze.csv")
+diner = conn.execute(
+    "SELECT * FROM transactions WHERE description='FROZEN KEY DINER'").fetchone()
+diner or fail("the freeze fixture did not import")
+imported_key = diner["dedup_key"]
+diner["amount_cents"] == -3140 or fail("the freeze fixture imported the wrong amount")
+
+rows_before = conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"]
+update(id=diner["id"], amount="99.99", side="credit")
+update(id=diner["id"], date="12/25/2026")
+update(id=diner["id"], description="CORRECTED DINER NAME")
+
+edited = txn(diner["id"])
+edited["dedup_key"] == imported_key or fail(
+    f"dedup_key changed under editing: {imported_key!r} -> {edited['dedup_key']!r}")
+(edited["amount_cents"], edited["txn_date"], edited["description"]) == (
+    9999, "2026-12-25", "CORRECTED DINER NAME") or fail("the edits did not all land")
+
+import_csv(FREEZE_CSV, "freeze.csv")
+conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"] == rows_before or fail(
+    "re-importing after an edit created a duplicate — the frozen key stopped matching")
+after_reimport = txn(diner["id"])
+(after_reimport["amount_cents"], after_reimport["txn_date"],
+ after_reimport["description"]) == (9999, "2026-12-25", "CORRECTED DINER NAME") or fail(
+    "the re-import overwrote the edited row")
+conn.execute("SELECT COUNT(*) n FROM transactions WHERE description='FROZEN KEY DINER'"
+             ).fetchone()["n"] == 0 or fail(
+    "the re-import re-added the original line alongside the edited one")
+
+# 26H. identity edits teach nothing, restated over every edit in this section
+rules_count() == rules_before_identity or fail(
+    "editing date / amount / description on the grid taught a merchant rule")
+
+# 26I. the grid exposes the new edit hooks and prefill data
+ident_html = client.get("/transactions").data.decode()
+ident_row = ident_html[ident_html.index(f"data-id='{ident}'"):]
+ident_row = ident_row[:ident_row.index("</tr>")]
+for hook in ("data-field='date'", "data-field='description'",
+             "data-field='debit'", "data-field='credit'",
+             "data-date=", "data-description=", "data-cents="):
+    hook in ident_row or fail(f"the row is missing {hook}")
+f"data-cents='{txn(ident)['amount_cents']}'" in ident_row or fail(
+    "data-cents should carry the signed integer cents for the editor to prefill")
+
+# 26J. sorting by amount puts the arrow on ONE column, not both
+asc_head = client.get("/transactions?sort=amount&dir=asc").data.decode()
+asc_head = asc_head[:asc_head.index("</tr>")]
+("Debit ▲" in asc_head and "Credit ▲" not in asc_head and "Credit ▼" not in asc_head) \
+    or fail("amount asc should mark Debit only")
+desc_head = client.get("/transactions?sort=amount&dir=desc").data.decode()
+desc_head = desc_head[:desc_head.index("</tr>")]
+("Credit ▼" in desc_head and "Debit ▼" not in desc_head and "Debit ▲" not in desc_head) \
+    or fail("amount desc should mark Credit only")
+# ...and both are still clickable links either way
+asc_head.count("sort=amount") == 2 or fail("both money headers should stay sortable links")
 
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")

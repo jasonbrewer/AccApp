@@ -20,6 +20,8 @@ client-interactive: a small amount of vanilla JS (no libraries, no CDN, all of
 it inline and local) adds inline editing of category / use / note with autosave.
 That grid is a deliberate non-teaching corrections surface — editing a row there
 never writes a merchant_rule. Rule learning lives on Categorize (and /review).
+Corrections there never rewrite dedup_key either: it is frozen at import, so a
+re-imported statement still dedups a row whose amount or date you have fixed.
 """
 
 import csv
@@ -376,6 +378,16 @@ BASE = """
   .cbx-list li{padding:5px 8px;border-radius:6px;font-size:13px;white-space:nowrap;cursor:pointer}
   .cbx-list li.on{background:var(--ink);color:var(--paper)}
   .cbx-list li.none{color:var(--muted);cursor:default}
+  .amt{position:absolute;right:0;top:4px;z-index:30;display:flex;gap:6px;align-items:center;
+    padding:4px;background:var(--card);border:1px solid var(--line);border-radius:9px;
+    box-shadow:0 8px 22px rgba(28,36,51,.14)}
+  td.ed .amt input[type=text]{width:92px;text-align:right;
+    font-variant-numeric:tabular-nums;font-family:ui-monospace,"SF Mono",Menlo,monospace}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .seg button{font:inherit;font-size:12px;padding:4px 9px;border:0;cursor:pointer;
+    background:#fff;color:var(--muted)}
+  .seg button.on{background:var(--ink);color:var(--paper)}
+  input.bad{border-color:#b4453c;background:#fdf5f4}
 </style></head><body>
 <header><div class=bar>
   <div class=brand>LocalLedger <span>· {{ year }}</span></div>
@@ -425,10 +437,34 @@ BASE = """
   box.appendChild(catInput);
   box.appendChild(list);
 
-  var noteInput = document.createElement("input");
-  noteInput.type = "text";
-  noteInput.autocomplete = "off";
-  noteInput.setAttribute("aria-label", "Note");
+  // One input serves note, date and description — they differ only in where
+  // the prefill comes from and whether the server can reject the value.
+  var TEXT_FIELDS = {note: "data-note", date: "data-date",
+                     description: "data-description"};
+  var textInput = document.createElement("input");
+  textInput.type = "text";
+  textInput.autocomplete = "off";
+
+  // Amount: one editor for the row, opened from either money column, because
+  // the magnitude and the column it sits in are a single decision.
+  var amt = document.createElement("div");
+  amt.className = "amt";
+  var amtInput = document.createElement("input");
+  amtInput.type = "text";
+  amtInput.autocomplete = "off";
+  amtInput.setAttribute("aria-label", "Amount");
+  var seg = document.createElement("div");
+  seg.className = "seg";
+  ["debit", "credit"].forEach(function (side) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.setAttribute("data-side", side);
+    b.textContent = side === "debit" ? "Debit" : "Credit";
+    seg.appendChild(b);
+  });
+  amt.appendChild(amtInput);
+  amt.appendChild(seg);
+  var amtSide = "debit";
 
   var open = null;      // {cell, field, html} while an editor is mounted
   var matches = [];
@@ -464,12 +500,24 @@ BASE = """
     }
   }
 
+  function text(cell, value) {
+    if (cell) cell.textContent = value;   // textContent, never innerHTML
+  }
+
   function paint(tr, d) {
     tr.dataset.category = d.category;
     tr.dataset.use = d.use;
     tr.dataset.note = d.note;
-    var c = cellOf(tr, "category");
-    if (c) c.textContent = label(d.category);
+    tr.dataset.date = d.date;
+    tr.dataset.description = d.description;
+    tr.dataset.cents = d.amount_cents;
+    text(cellOf(tr, "date"), d.date);
+    text(cellOf(tr, "description"), d.description);
+    text(cellOf(tr, "category"), label(d.category));
+    // Both money columns every time, so a sign flip is visibly a move from one
+    // column to the other. The strings were formatted by money() server-side.
+    text(cellOf(tr, "debit"), d.debit);
+    text(cellOf(tr, "credit"), d.credit);
     var u = cellOf(tr, "use");
     if (u) u.innerHTML = usePill(d.use);
     var n = cellOf(tr, "note");
@@ -478,24 +526,36 @@ BASE = """
     if (s) s.innerHTML = statusPill(d.reviewed);
   }
 
-  function save(tr, field, value) {
+  function post(tr, fields) {
     var body = new URLSearchParams();
     body.append("id", tr.dataset.id);
-    body.append(field, value);
+    Object.keys(fields).forEach(function (k) { body.append(k, fields[k]); });
     tr.classList.remove("stale");
     tr.classList.add("saving");
-    fetch(SAVE_URL, {
+    return fetch(SAVE_URL, {
       method: "POST",
       headers: {"Content-Type": "application/x-www-form-urlencoded"},
       body: body.toString()
     }).then(function (r) {
-      return r.ok ? r.json() : null;
-    }).then(function (d) {
       tr.classList.remove("saving");
-      if (d && d.ok) { paint(tr, d); } else { stale(tr); }
+      if (r.ok) return r.json();
+      // 400 means the server refused this value and wrote nothing, so the row
+      // on screen is still right — the caller keeps the editor up instead.
+      // Anything else is a real failure and the row can no longer be trusted.
+      if (r.status !== 400) stale(tr);
+      return null;
     }).catch(function () {
       tr.classList.remove("saving");
       stale(tr);
+      return null;
+    });
+  }
+
+  function save(tr, field, value) {
+    var fields = {};
+    fields[field] = value;
+    post(tr, fields).then(function (d) {
+      if (d) { paint(tr, d); } else { stale(tr); }
     });
   }
 
@@ -513,6 +573,25 @@ BASE = """
     open = null;
     o.cell.innerHTML = o.html;   // save() repaints from the response
     return o;
+  }
+
+  function settle(o, tr, pending, input) {
+    /* What to do once a commit comes back.
+
+       On success the row repaints from the reply. On a refusal the editor
+       stays up holding what was typed — a date that won't parse shouldn't
+       silently vanish and leave the old one looking accepted. If another
+       editor was opened while the request was in flight, this one is stale
+       and gets out of the way. */
+    return pending.then(function (d) {
+      if (d) {
+        if (open === o) closeEditor();
+        paint(tr, d);
+      } else if (open === o) {
+        input.className = "bad";
+        input.focus();
+      }
+    });
   }
 
   /* ---- category: type-ahead combobox ---- */
@@ -601,30 +680,36 @@ BASE = """
     if (li) chooseCategory(li.getAttribute("data-name"));
   });
 
-  /* ---- note: plain inline input ---- */
-  function openNote(cell) {
+  /* ---- note / date / description: one plain inline input ---- */
+  function openText(cell, field) {
     closeEditor();
     var tr = cell.parentNode;
-    open = {cell: cell, field: "note", html: cell.innerHTML};
+    open = {cell: cell, field: field, html: cell.innerHTML};
     cell.textContent = "";
-    cell.appendChild(noteInput);
-    noteInput.value = tr.getAttribute("data-note") || "";
-    noteInput.focus();
-    noteInput.select();
+    cell.appendChild(textInput);
+    textInput.className = "";
+    textInput.value = tr.getAttribute(TEXT_FIELDS[field]) || "";
+    textInput.focus();
+    textInput.select();
   }
 
-  function commitNote() {
-    if (!open || open.field !== "note") return;
-    var tr = open.cell.parentNode;
-    var value = noteInput.value;
-    closeEditor();
-    if (value.trim() !== (tr.getAttribute("data-note") || "")) save(tr, "note", value);
+  function commitText() {
+    if (!open || !TEXT_FIELDS[open.field]) return;
+    var o = open, tr = o.cell.parentNode, field = o.field;
+    var value = textInput.value;
+    if (value.trim() === (tr.getAttribute(TEXT_FIELDS[field]) || "")) {
+      closeEditor();          // nothing actually changed
+      return;
+    }
+    var fields = {};
+    fields[field] = value;
+    settle(o, tr, post(tr, fields), textInput);
   }
 
-  noteInput.addEventListener("keydown", function (e) {
+  textInput.addEventListener("keydown", function (e) {
     if (e.key === "Enter") {
       e.preventDefault();
-      commitNote();
+      commitText();
     } else if (e.key === "Escape") {
       e.preventDefault();
       // closeEditor() clears `open`, so the blur that follows is a no-op.
@@ -633,7 +718,68 @@ BASE = """
     }
   });
 
-  noteInput.addEventListener("blur", commitNote);
+  textInput.addEventListener("blur", commitText);
+
+  /* ---- amount: magnitude in the input, sign in the Debit/Credit toggle ---- */
+  function magnitude(cents) {
+    // Integer cents only — invariant 1 holds on this side of the wire too.
+    var n = Math.abs(cents);
+    return Math.floor(n / 100) + "." + ("0" + (n % 100)).slice(-2);
+  }
+
+  function drawSides() {
+    for (var i = 0; i < seg.children.length; i++) {
+      var b = seg.children[i];
+      b.className = b.getAttribute("data-side") === amtSide ? "on" : "";
+    }
+  }
+
+  function openAmount(cell) {
+    closeEditor();
+    var tr = cell.parentNode;
+    var cents = parseInt(tr.getAttribute("data-cents"), 10);
+    if (isNaN(cents)) cents = 0;
+    open = {cell: cell, field: "amount", html: cell.innerHTML};
+    amtSide = cents > 0 ? "credit" : "debit";     // a zero row opens as a debit
+    cell.textContent = "";
+    cell.appendChild(amt);
+    amtInput.className = "";
+    amtInput.value = cents ? magnitude(cents) : "";
+    drawSides();
+    amtInput.focus();
+    amtInput.select();
+  }
+
+  function commitAmount() {
+    if (!open || open.field !== "amount") return;
+    var o = open, tr = o.cell.parentNode;
+    settle(o, tr, post(tr, {amount: amtInput.value, side: amtSide}), amtInput);
+  }
+
+  amtInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitAmount();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      var o = closeEditor();
+      if (o) o.cell.focus();
+    }
+  });
+
+  amtInput.addEventListener("blur", commitAmount);
+
+  // Same trick as the dropdown: the toggle must not take focus, or the input
+  // would blur and commit before the new side had been chosen.
+  seg.addEventListener("mousedown", function (e) { e.preventDefault(); });
+
+  seg.addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-side]");
+    if (!b) return;
+    amtSide = b.getAttribute("data-side");
+    drawSides();
+    amtInput.focus();
+  });
 
   /* ---- one delegated listener for the whole grid ---- */
   function edit(cell) {
@@ -643,15 +789,17 @@ BASE = """
       save(tr, "use", tr.getAttribute("data-use") === "business" ? "personal" : "business");
     } else if (field === "category") {
       openCategory(cell);
-    } else if (field === "note") {
-      openNote(cell);
+    } else if (field === "debit" || field === "credit") {
+      openAmount(cell);
+    } else if (TEXT_FIELDS[field]) {
+      openText(cell, field);
     }
   }
 
   grid.addEventListener("click", function (e) {
     // A pick from the dropdown bubbles through the cell it belongs to; it is
     // the selection, not a fresh click on that cell.
-    if (e.target.closest(".cbx")) return;
+    if (e.target.closest(".cbx, .amt")) return;
     var cell = e.target.closest("td.ed");
     if (!cell) return;
     if (open && open.cell === cell) return;   // a click inside the live editor
@@ -1377,11 +1525,17 @@ def parse_sort(args):
     return key, direction
 
 
-def sort_header(label, key, default_dir, sort, direction, cls=""):
-    """A clickable <th>: flips the active column, else opens on default_dir."""
+def sort_header(label, key, default_dir, sort, direction, cls="", arrow_dir=None):
+    """A clickable <th>: flips the active column, else opens on default_dir.
+
+    Debit and Credit are one sort key (`amount`) shown in two columns, so
+    without `arrow_dir` they would both claim the arrow at once. Passing it
+    lets each own a single direction: money-out on asc, money-in on desc.
+    """
     if key == sort:
         nxt = "asc" if direction == "DESC" else "desc"
-        label += " ▲" if direction == "ASC" else " ▼"
+        if arrow_dir is None or arrow_dir == direction:
+            label += " ▲" if direction == "ASC" else " ▼"
     else:
         nxt = default_dir
     href = f"{url_for('transactions')}?sort={key}&amp;dir={nxt}"
@@ -1398,9 +1552,19 @@ def script_json(value):
     return json.dumps(value).replace("<", "\\u003c")
 
 
-def edit_cell(field, inner, extra=""):
+def amount_cells(cents):
+    """(debit, credit) display strings for one signed amount.
+
+    The single place that decides which column a value belongs in, so the page
+    and the autosave reply can never disagree. Zero shows in neither column.
+    """
+    return (money(cents) if cents < 0 else "",
+            money(cents) if cents > 0 else "")
+
+
+def edit_cell(field, inner, cls="ed"):
     """An editable grid cell. `inner` is already escaped by the caller."""
-    return f"<td class='ed'{extra} data-field='{field}' tabindex='0'>{inner}</td>"
+    return f"<td class='{cls}' data-field='{field}' tabindex='0'>{inner}</td>"
 
 
 @app.route("/transactions")
@@ -1430,32 +1594,36 @@ def transactions():
         # One signed amount_cents, shown in two columns. Display only — storage
         # is unchanged, and the debit keeps its minus sign.
         cents = t["amount_cents"]
-        debit = money(cents) if cents < 0 else ""
-        credit = money(cents) if cents > 0 else ""
+        debit, credit = amount_cells(cents)
         # data-* carries the row's current values so the editor never has to
         # parse them back out of the cells.
         trs += (f"<tr data-id='{t['id']}' data-category=\"{esc(catname)}\""
-                f" data-use=\"{esc(use)}\" data-note=\"{esc(t['note'])}\">"
-                f"<td>{esc(t['txn_date'])}</td>"
-                f"<td>{esc(t['description'])}</td>"
+                f" data-use=\"{esc(use)}\" data-note=\"{esc(t['note'])}\""
+                f" data-date=\"{esc(t['txn_date'])}\""
+                f" data-description=\"{esc(t['description'])}\""
+                f" data-cents='{cents}'>"
+                + edit_cell("date", esc(t["txn_date"]))
+                + edit_cell("description", esc(t["description"]))
                 + edit_cell("category", esc(catname))
                 + edit_cell("use", upill)
                 + f"<td class='status'>{state}</td>"
                 + edit_cell("note", note)
-                + f"<td class='r num'>{debit}</td>"
-                f"<td class='r num'>{credit}</td></tr>")
+                + edit_cell("debit", debit, cls="r num ed")
+                + edit_cell("credit", credit, cls="r num ed") + "</tr>")
     # Debit opens on asc (biggest money out on top), Credit on desc (biggest in).
     heads = (sort_header("Date", "date", "desc", sort, direction)
              + sort_header("Description", "desc", "asc", sort, direction)
              + sort_header("Category", "cat", "asc", sort, direction)
              + "<th>Use</th><th>Status</th><th>Note</th>"
-             + sort_header("Debit", "amount", "asc", sort, direction, cls=" class=r")
-             + sort_header("Credit", "amount", "desc", sort, direction, cls=" class=r"))
+             + sort_header("Debit", "amount", "asc", sort, direction,
+                           cls=" class=r", arrow_dir="ASC")
+             + sort_header("Credit", "amount", "desc", sort, direction,
+                           cls=" class=r", arrow_dir="DESC"))
     # The picker's whole vocabulary, handed over once. No fetch, no round trip.
     cats = script_json(db.category_names(conn))
     body = f"""<h1>Transactions</h1>
-      <p class=sub>{len(rows)} transactions in {YEAR}. Click a category, use or
-      note to edit it — changes save as you go and stay on this row.</p>
+      <p class=sub>{len(rows)} transactions in {YEAR}. Click any cell but Status
+      to edit it — changes save as you go and stay on this row.</p>
       <script type="application/json" id="cat-list">{cats}</script>
       <table id="txn-grid"><tr>{heads}</tr>{trs}</table>"""
     return page(body, "txns")
@@ -1473,9 +1641,15 @@ def transactions_update():
     merchant means. Teaching stays on /categorize and /review, where the user
     is deliberately deciding for a whole merchant.
 
-    It also never touches amount_cents, txn_date, description, merchant_norm or
-    dedup_key: no money, no identity, no dedup. Same no-CSRF posture as every
-    other POST here — this is a single-user app bound to localhost.
+    It NEVER writes dedup_key. That key is frozen at import: it is what makes
+    a re-imported statement skip rows you already have, so correcting a typo in
+    an amount or a date must not change it. merchant_norm is different — it is
+    a live matching key, not an identity, so an edited description recomputes
+    it. Same no-CSRF posture as every other POST here — a single-user app bound
+    to localhost.
+
+    Validation all happens before the single UPDATE, so a rejected field means
+    nothing at all was written, not a half-applied row.
     """
     conn = get_conn()
     row = conn.execute(
@@ -1504,6 +1678,33 @@ def transactions_update():
     if "note" in request.form:
         sets.append("note=?")
         vals.append(request.form["note"].strip())
+    if "date" in request.form:
+        stamp = normalize_date(request.form["date"].strip())
+        if stamp is None:
+            return jsonify(ok=False, error="unreadable date"), 400
+        sets.append("txn_date=?")
+        vals.append(stamp)
+    if "amount" in request.form:
+        # Magnitude from the text, sign from the column — the two Debit/Credit
+        # cells are the only thing that decides in or out.
+        cents = parse_amount_to_cents(request.form["amount"])
+        side = request.form.get("side")
+        if cents is None:
+            return jsonify(ok=False, error="unreadable amount"), 400
+        if side not in ("debit", "credit"):
+            return jsonify(ok=False, error="side must be debit or credit"), 400
+        magnitude = abs(cents)      # integer cents throughout — invariant 1
+        sets.append("amount_cents=?")
+        vals.append(-magnitude if side == "debit" else magnitude)
+    if "description" in request.form:
+        desc = request.form["description"].strip()
+        if not desc:
+            return jsonify(ok=False, error="description cannot be empty"), 400
+        # merchant_norm follows the description because it is a matching key
+        # derived from it. Deriving it is not teaching: no merchant_rules row
+        # is written here, and none ever is on this path.
+        sets += ["description=?", "merchant_norm=?"]
+        vals += [desc, normalize_merchant(desc)]
 
     if sets:
         conn.execute(f"UPDATE transactions SET {', '.join(sets)} WHERE id=?",
@@ -1513,15 +1714,21 @@ def transactions_update():
     # Answer with what is actually stored, not with what was asked for, so the
     # grid repaints from the database rather than from its own optimism.
     saved = conn.execute(
-        """SELECT t.id, t.use, t.note, t.reviewed, a.default_use, c.name catname
+        """SELECT t.id, t.txn_date, t.description, t.amount_cents, t.use, t.note,
+                  t.reviewed, a.default_use, c.name catname
              FROM transactions t
              JOIN accounts a ON a.id=t.account_id
              LEFT JOIN categories c ON c.id=t.category_id
             WHERE t.id=?""", (row["id"],)).fetchone()
+    # money() runs here, not in the browser: the client does no money math.
+    debit, credit = amount_cells(saved["amount_cents"])
     return jsonify(ok=True, id=saved["id"],
                    category=saved["catname"] or "Uncategorized",
                    use=txn_use(saved), reviewed=saved["reviewed"],
-                   note=saved["note"])
+                   note=saved["note"], date=saved["txn_date"],
+                   description=saved["description"],
+                   amount_cents=saved["amount_cents"],
+                   debit=debit, credit=credit)
 
 
 def normalize_date(raw):

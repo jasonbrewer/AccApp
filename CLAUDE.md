@@ -63,6 +63,14 @@ newer OS or that won't run on Ventura.
    directly — go through `Categorizer`.
 7. **Import is idempotent.** Re-importing an overlapping statement must not create
    duplicates (`dedup_key` UNIQUE). Preserve this.
+   - **`dedup_key` is frozen at import.** No edit ever recomputes or rewrites
+     it — correcting a date, an amount or a description on the Transactions
+     grid leaves it byte-identical, so re-importing the original statement
+     still recognizes the row and skips it. The key identifies *the line as the
+     bank sent it*, not the line as you've since corrected it.
+   - `merchant_norm`, by contrast, IS recomputed from an edited description: it
+     is a live matching key derived from the text, not an identity. Deriving it
+     writes no `merchant_rules` row — the grid still never teaches.
 8. **Confirmations teach rules.** When the user sets a category in review, upsert
    a `merchant_rules` row so it's rule-matched next time. Keep this learning loop.
 
