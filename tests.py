@@ -791,6 +791,8 @@ def rendered_rows(query=""):
     # rows now carry data-* hooks for the inline editor
     return re.findall(
         r"<tr data-id='\d+'[^>]*>"
+        # the leftmost cell is now the multi-select checkbox, not a data cell
+        r"<td class=pick>.*?</td>"
         r"<td class='ed' data-field='date' tabindex='0'>(\d{4}-\d{2}-\d{2})</td>"
         r"<td class='ed' data-field='description' tabindex='0'>(.*?)</td>", body)
 
@@ -1221,6 +1223,210 @@ desc_head = desc_head[:desc_head.index("</tr>")]
     or fail("amount desc should mark Credit only")
 # ...and both are still clickable links either way
 asc_head.count("sort=amount") == 2 or fail("both money headers should stay sortable links")
+
+# ---------------------------------------------------------------------------
+# 27. transactions grid: multi-select + bulk set category / use / delete
+#
+# Same rule as the single-row editor, at scale: bulk CORRECTS rows and teaches
+# nothing. Forty rows is exactly where a silently learned merchant rule would
+# do the most damage, so the no-teach check is restated after every bulk op.
+# ---------------------------------------------------------------------------
+
+BULK_CSV = """Date,Description,Amount
+2026-08-01,BULKONE HARDWARE,-11.00
+2026-08-02,BULKTWO HARDWARE,-12.00
+2026-08-03,BULKTHREE HARDWARE,-13.00
+2026-08-04,BULKFOUR HARDWARE,-14.00
+"""
+
+import_csv(BULK_CSV, "bulk.csv")
+
+
+def bulk_ids(prefix="BULK"):
+    """Ids of the bulk fixture rows, in import order."""
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM transactions WHERE description LIKE ? ORDER BY id",
+        (prefix + "%",))]
+
+
+def bulk(ids=None, **form):
+    data = dict(form)
+    if ids is not None:
+        data["ids"] = [str(i) for i in ids]
+    return client.post("/transactions/bulk", data=data)
+
+
+ids = bulk_ids()
+len(ids) == 4 or fail(f"the bulk fixture should import 4 rows, got {len(ids)}")
+rules_before_bulk = rules_count()
+
+# 27A. THE MARQUEE TEST — a bulk category stamps the rows and teaches nothing.
+r = bulk(ids[:3], action="category", value="Equipment")
+r.status_code == 200 or fail(f"a bulk category returned {r.status_code}")
+out = J.loads(r.data)
+(out["ok"], out["action"], out["affected"]) == (True, "category", 3) or fail(
+    f"bulk category answered {out}")
+for tid in ids[:3]:
+    row = txn(tid)
+    row["catname"] == "Equipment" or fail(
+        f"bulk category did not stamp {tid}: {row['catname']}")
+    row["category_source"] == "user" or fail(
+        f"a bulk category must be category_source='user', got {row['category_source']}")
+    row["reviewed"] == 1 or fail("a bulk category must mark the row reviewed")
+txn(ids[3])["catname"] != "Equipment" or fail(
+    "a bulk category touched a row that was not selected")
+
+rules_count() == rules_before_bulk or fail(
+    "BULK CATEGORY TAUGHT A MERCHANT RULE — the grid must never teach")
+
+# 27B. an unknown category name falls back to Uncategorized, like everywhere else
+bulk([ids[3]], action="category", value="No Such Category").status_code == 200 or fail(
+    "an unknown bulk category name should still be accepted")
+txn(ids[3])["catname"] == "Uncategorized" or fail(
+    f"unknown bulk category should fall back, got {txn(ids[3])['catname']}")
+
+# 27C. bulk use sets `use` on every selected row and leaves `reviewed` alone
+conn.execute("UPDATE transactions SET reviewed=0, use='business' WHERE id IN (?,?)",
+             (ids[0], ids[1]))
+conn.commit()
+reviewed_before = [txn(t)["reviewed"] for t in ids]
+r = bulk(ids[:3], action="use", value="personal")
+r.status_code == 200 or fail(f"a bulk use returned {r.status_code}")
+J.loads(r.data)["affected"] == 3 or fail("bulk use reported the wrong count")
+for tid in ids[:3]:
+    txn(tid)["use"] == "personal" or fail(f"bulk use did not set {tid}")
+[txn(t)["reviewed"] for t in ids] == reviewed_before or fail(
+    "a bulk use edit must not change reviewed — it is not a decision about what a row is")
+txn(ids[3])["use"] != "personal" or fail(
+    "bulk use touched a row that was not selected")
+rules_count() == rules_before_bulk or fail("bulk use taught a merchant rule")
+
+# 27D. an invalid use is refused outright and writes nothing
+before = [(txn(t)["use"], txn(t)["reviewed"]) for t in ids]
+r = bulk(ids, action="use", value="bogus")
+r.status_code == 400 or fail(f"use=bogus should be 400, got {r.status_code}")
+J.loads(r.data)["ok"] is False or fail("a refused bulk should answer ok:false")
+[(txn(t)["use"], txn(t)["reviewed"]) for t in ids] == before or fail(
+    "a refused bulk use wrote something anyway")
+
+# 27E. no valid ids, and an unknown action, are both refused with nothing written
+rows_before_bad = conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"]
+for bad in ({"ids": ["x", "", "12.5"], "action": "category", "value": "Equipment"},
+            {"action": "delete"}):
+    r = client.post("/transactions/bulk", data=bad)
+    r.status_code == 400 or fail(f"{bad} should be 400, got {r.status_code}")
+    J.loads(r.data)["ok"] is False or fail("a refused bulk should answer ok:false")
+r = bulk(ids, action="teach")
+r.status_code == 400 or fail(f"an unknown action should be 400, got {r.status_code}")
+r = bulk(ids, action="")
+r.status_code == 400 or fail("an empty action should be 400")
+conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"] == rows_before_bad or fail(
+    "a refused bulk deleted rows")
+
+# 27F. injection guard — an id is an int or it is not an id
+r = client.post("/transactions/bulk", data={
+    "ids": ["1); DROP TABLE transactions--", "'; DELETE FROM transactions; --"],
+    "action": "delete"})
+r.status_code == 400 or fail("ids that are not ints must leave nothing valid to act on")
+conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"] == rows_before_bad or fail(
+    "the transactions table did not survive an injection attempt")
+conn.execute("SELECT COUNT(*) n FROM sqlite_master WHERE name='transactions'"
+             ).fetchone()["n"] == 1 or fail("the transactions table was dropped")
+# ...and a good id mixed in with junk still works, junk dropped
+r = bulk(["nope", ids[0], "1;--"], action="category", value="Meals")
+J.loads(r.data)["affected"] == 1 or fail("junk ids should be dropped, not fatal")
+txn(ids[0])["catname"] == "Meals" or fail("the one real id in the list should still apply")
+
+# 27G. bulk delete removes exactly the selected rows and reports the count
+survivor = ids[3]
+r = bulk(ids[:2], action="delete")
+r.status_code == 200 or fail(f"a bulk delete returned {r.status_code}")
+out = J.loads(r.data)
+(out["ok"], out["action"], out["affected"]) == (True, "delete", 2) or fail(
+    f"bulk delete answered {out}")
+for tid in ids[:2]:
+    txn(tid) is None or fail(f"row {tid} should be gone after a bulk delete")
+txn(ids[2]) is not None and txn(survivor) is not None or fail(
+    "a bulk delete removed rows that were not selected")
+rules_count() == rules_before_bulk or fail("bulk delete taught a merchant rule")
+
+# 27H. delete <-> dedup: a deleted row's dedup_key goes with it, so re-importing
+# the same statement brings that line back — and only that line.
+gone_desc = "BULKONE HARDWARE"
+conn.execute("SELECT COUNT(*) n FROM transactions WHERE description=?",
+             (gone_desc,)).fetchone()["n"] == 0 or fail("the fixture row is still here")
+import_csv(BULK_CSV, "bulk.csv")
+back = conn.execute(
+    "SELECT COUNT(*) n FROM transactions WHERE description LIKE 'BULK%'").fetchone()["n"]
+back == 4 or fail(f"re-import should restore the 2 deleted rows and no more, got {back}")
+for desc in ("BULKONE HARDWARE", "BULKTWO HARDWARE"):
+    conn.execute("SELECT COUNT(*) n FROM transactions WHERE description=?",
+                 (desc,)).fetchone()["n"] == 1 or fail(f"{desc} did not come back exactly once")
+for desc in ("BULKTHREE HARDWARE", "BULKFOUR HARDWARE"):
+    conn.execute("SELECT COUNT(*) n FROM transactions WHERE description=?",
+                 (desc,)).fetchone()["n"] == 1 or fail(
+        f"the surviving row {desc} was duplicated by the re-import")
+# the surviving rows kept the categories they were bulk-stamped with
+txn(ids[2])["catname"] == "Equipment" or fail(
+    "the re-import overwrote a surviving row's bulk-set category")
+
+# 27I. bulk delete leaves import_batches alone — the history counts live
+batches_before = conn.execute("SELECT COUNT(*) n FROM import_batches").fetchone()["n"]
+doomed = bulk_ids()[:1]
+bulk(doomed, action="delete").status_code == 200 or fail("bulk delete failed")
+conn.execute("SELECT COUNT(*) n FROM import_batches").fetchone()["n"] == batches_before or fail(
+    "bulk delete removed an import_batches row — the history should count live instead")
+client.get("/import").status_code == 200 or fail(
+    "the import history should still render after a bulk delete")
+
+# 27J. no teach, restated across every bulk op in this section
+rules_count() == rules_before_bulk or fail(
+    "some bulk operation taught a merchant rule — bulk must never teach")
+
+# 27K. the grid renders the select column and a hidden bulk bar
+bulk_html = client.get("/transactions").data.decode()
+"id=sel-all" in bulk_html or fail("the header should carry a select-all checkbox")
+bulk_html.count("class=rowsel") == conn.execute(
+    "SELECT COUNT(*) n FROM transactions").fetchone()["n"] or fail(
+    "every row should carry a select checkbox")
+'<div id="bulk-bar" class=bulk hidden>' in bulk_html or fail(
+    "the bulk bar should render hidden — with JS off it must stay inert")
+for hook in ('data-bulk="category"', 'data-bulk="business"', 'data-bulk="personal"',
+             'data-bulk="delete"', 'data-bulk="clear"', 'id="bulk-cat"',
+             'id="bulk-count"'):
+    hook in bulk_html or fail(f"the bulk bar is missing {hook}")
+# the select column is not an editable cell, so a click there opens no editor
+"<td class=pick><input type=checkbox class=rowsel" in bulk_html or fail(
+    "the select cell must be a plain td.pick, never a td.ed")
+"class='ed' data-field='pick'" not in bulk_html or fail(
+    "the select column must not be an editable field")
+# the bulk category picker offers the same vocabulary as everything else
+for name in D.category_names(conn):
+    f'<option value="{A.esc(name)}">' in bulk_html or fail(
+        f"the bulk category select is missing {name}")
+
+# 27L. nothing in this feature is a schema change
+have = {r["name"] for r in conn.execute(
+    "SELECT name FROM sqlite_master WHERE type='table'")}
+have >= {"transactions", "merchant_rules", "import_batches", "accounts",
+         "categories", "transfers", "allocations", "documents", "attachments"} or fail(
+    "a table went missing")
+cols = {r[1] for r in conn.execute("PRAGMA table_info(transactions)")}
+cols == {"id", "account_id", "txn_date", "description", "merchant_norm",
+         "amount_cents", "use", "category_id", "category_source", "ai_confidence",
+         "reviewed", "reconciled", "note", "import_batch_id", "dedup_key",
+         "created_at"} or fail(f"the transactions columns changed: {sorted(cols)}")
+
+# 27M. the endpoint never teaches, in the source as well as in behavior
+src = io.open("app.py", encoding="utf-8").read()
+handler = src[src.index("def transactions_bulk("):]
+handler = handler[:handler.index("\ndef ", 1)]
+# the docstring names both on purpose; what matters is the code under it
+code = handler.split('"""')[2]
+"teach_merchant_rule" not in code or fail(
+    "/transactions/bulk must not call teach_merchant_rule")
+"import_batches" not in code or fail(
+    "/transactions/bulk must not write to import_batches")
 
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")

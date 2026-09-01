@@ -44,6 +44,16 @@ newer OS or that won't run on Ventura.
   corrections surface — editing a row there fixes that row and writes no
   `merchant_rules` entry. Merchant-rule learning lives on the Categorize page
   (and `/review`), where the user is deciding for a whole merchant on purpose.
+  - **Bulk actions on the grid are non-teaching too.** Multi-select plus
+    `POST /transactions/bulk` (set category, set use, delete) stamps the rows
+    you ticked and nothing else — no `merchant_rules` row, ever. Forty rows at
+    once is precisely where a silently learned rule would do the most damage,
+    so the rule is stricter here, not looser. A test enforces it.
+  - **Bulk delete really deletes.** The row goes, and its `dedup_key` goes with
+    it, so re-importing the same statement re-adds exactly what you removed.
+    That is the same bargain as undoing an import, and it is deliberate: there
+    is no tombstone. Bulk delete leaves `import_batches` alone — the import
+    history counts the rows still present, so it stays honest on its own.
 
 ## Invariants — do not break these
 
