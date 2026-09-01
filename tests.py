@@ -609,7 +609,7 @@ b"That upload expired" in r.data or fail("/import/map should report an expired t
 ledger_size() == before or fail("an expired preview wrote to the ledger")
 
 # ---------------------------------------------------------------------------
-# 22G-22M. Money style toggle. The mapping page used to render ONLY the fields
+# 22G-22N. Money style toggle. The mapping page used to render ONLY the fields
 # for the detected mode, so switching the radio submitted a mode whose column
 # selects were never on the page: they resolved to None, read_row did row[None],
 # and the preview 500'd. Both groups now always render.
