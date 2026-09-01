@@ -609,6 +609,171 @@ b"That upload expired" in r.data or fail("/import/map should report an expired t
 ledger_size() == before or fail("an expired preview wrote to the ledger")
 
 # ---------------------------------------------------------------------------
+# 22G-22M. Money style toggle. The mapping page used to render ONLY the fields
+# for the detected mode, so switching the radio submitted a mode whose column
+# selects were never on the page: they resolved to None, read_row did row[None],
+# and the preview 500'd. Both groups now always render.
+# ---------------------------------------------------------------------------
+
+def preview(phase1, **fields):
+    """POST the preview route under an explicit mapping, the way the page does."""
+    found = TOKEN_RE.search(phase1.data)
+    found or fail("phase 1 did not render a mapping page to preview")
+    data = {"token": found.group(1).decode(), "account_id": "1"}
+    data.update(fields)
+    return client.post("/import/map", data=data)
+
+
+def selected_col(html, name):
+    """The column index a rendered <select> has chosen, or None if it chose none."""
+    block = re.search(("<select name=%s>(.*?)</select>" % name).encode(), html, re.S)
+    block or fail(f"the mapping page is missing a {name} select")
+    chosen = re.search(rb'<option value="(\d+)" selected', block.group(1))
+    return int(chosen.group(1)) if chosen else None
+
+
+# A single-amount file that also carries an Out / In pair, so the same upload
+# can be previewed both ways.
+TOGGLE = ("Date,Description,Amount,Out,In\n"
+          "09/01/2026,FAKE TOGGLE HARDWARE,,5.21,\n"
+          "09/02/2026,FAKE TOGGLE REFUND,,,10.00\n")
+# ...and a debit/credit file that also carries one signed column, for the
+# reverse switch.
+REVERSE = ("Date,Description,Debit,Credit,Signed\n"
+           "09/03/2026,FAKE REVERSE GROCER,12.34,,-12.34\n"
+           "09/04/2026,FAKE REVERSE PAYCHECK,,500.00,500.00\n")
+
+# 22G. THE REGRESSION: a single-amount file previewed as debit/credit with no
+# debit_col / credit_col submitted. Both resolve to None, and row[None] raises
+# TypeError — which the old IndexError-only skip path let through as a 500.
+before = ledger_size()
+phase1 = upload_csv(PLAIN, "toggle_crash.csv")
+r = preview(phase1, date_col="0", desc_col="1", mode="debitcredit")
+r.status_code == 200 or fail(
+    f"a mode with no money columns must render, not {r.status_code}")
+b"Check the columns" in r.data or fail(
+    "the mapping page should still render under an unusable money mapping")
+b"row skipped under this mapping" in r.data or fail(
+    "rows unreadable under the submitted mapping should be shown as skipped")
+ledger_size() == before or fail("the crashing preview wrote to the ledger")
+
+# ...and the guard lives in read_row itself: a None column is an unreadable row,
+# never an exception. Remove the guard and these are the assertions that go red.
+ROW = ["05/01/2026", "FAKE GUARD CO", "-10.00"]
+A.read_row(ROW, {"date": 0, "desc": 1, "mode": "debitcredit",
+                 "debit": None, "credit": None}) is None or fail(
+    "read_row must read a None debit/credit column as an unreadable row")
+A.read_row(ROW, {"date": 0, "desc": 1, "mode": "single",
+                 "amount": None}) is None or fail(
+    "read_row must read a None amount column as an unreadable row")
+A.read_row(ROW, {"date": None, "desc": 1, "mode": "single",
+                 "amount": 2}) is None or fail(
+    "read_row must read a None date column as an unreadable row")
+A.read_row(ROW, {"date": 0, "desc": None, "mode": "single",
+                 "amount": 2}) is None or fail(
+    "read_row must read a None description column as an unreadable row")
+# a short row still skips exactly as it always did
+A.read_row(["05/01/2026"], {"date": 0, "desc": 1, "mode": "single",
+                            "amount": 2}) is None or fail(
+    "a short row must still be skipped")
+A.read_row(ROW, {"date": 0, "desc": 1, "mode": "single", "amount": 2}) \
+    == ("2026-05-01", "FAKE GUARD CO", -1000) or fail(
+    "a readable row must still read exactly as before")
+
+# 22H. both money groups render whatever the detected mode is, so the toggle has
+# something to toggle — and every money select names a real column, so a switch
+# previews real data instead of nothing.
+for text, name, shape in ((PLAIN, "groups_single.csv", "a single-detected file"),
+                          (REVERSE, "groups_dc.csv", "a debitcredit-detected file")):
+    html = upload_csv(text, name).data
+    for field in (b"amount_col", b"debit_col", b"credit_col"):
+        b"name=" + field in html or fail(
+            f"{shape} should still render the {field.decode()} select")
+    b"name=sign" in html or fail(f"{shape} should still render the sign select")
+    b"data-money=single" in html or fail(f"{shape} is missing the single-amount group")
+    b"data-money=debitcredit" in html or fail(f"{shape} is missing the debit/credit group")
+    for field in ("amount_col", "debit_col", "credit_col"):
+        selected_col(html, field) is not None or fail(
+            f"{shape} rendered {field} with no column chosen")
+    selected_col(html, "debit_col") != selected_col(html, "credit_col") or fail(
+        f"{shape} defaulted Debit and Credit to the same column")
+    # JS-off degradation: neither group may be hidden by an attribute the
+    # script has to remove — the page has to work with no script at all.
+    b"data-money=single hidden" not in html and b"data-money=debitcredit hidden" not in html \
+        or fail(f"{shape} hid a money group server-side; JS-off would lose it")
+
+# 22I. detection still wins where it has an answer: the switch only fills in the
+# columns detection left as None.
+html = upload_csv(REVERSE, "detect_wins.csv").data
+(selected_col(html, "debit_col"), selected_col(html, "credit_col")) == (2, 3) or fail(
+    "the detected debit/credit pair should stay selected")
+selected_col(html, "amount_col") is not None or fail(
+    "the unused single-amount select still needs a real column")
+
+# 22J. switching works: the same single-amount upload previewed as debit/credit
+# with valid columns shows the debit/credit-derived amounts.
+phase1 = upload_csv(TOGGLE, "toggle.csv")
+b"row skipped under this mapping" in phase1.data or fail(
+    "under auto-detect TOGGLE's empty Amount column makes every row unreadable")
+r = preview(phase1, date_col="0", desc_col="1", mode="debitcredit",
+            debit_col="3", credit_col="4")
+r.status_code == 200 or fail("the switched preview should render")
+b"FAKE TOGGLE HARDWARE" in r.data or fail("the switched preview should show rows")
+b"-$5.21" in r.data or fail("a money-out row should preview negative under debit/credit")
+b"$10.00" in r.data or fail("a money-in row should preview positive under debit/credit")
+
+# 22K. reverse direction: a debitcredit-detected file previewed as a single
+# signed column.
+phase1 = upload_csv(REVERSE, "reverse.csv")
+r = preview(phase1, date_col="0", desc_col="1", mode="single", amount_col="4",
+            sign="negative")
+r.status_code == 200 or fail("the reverse switch should render")
+b"-$12.34" in r.data or fail("the signed column should preview its own sign")
+b"$500.00" in r.data or fail("the money-in row should preview positive")
+b"row skipped under this mapping" not in r.data or fail(
+    "every row should read under the single-column mapping")
+
+# 22L. ...and a preview never writes, whichever way it was switched
+ledger_size() == before or fail(f"a switched preview wrote to the ledger: {ledger_size()}")
+
+# 22M. committing under each mode is unchanged: the same upload imports the
+# amounts its preview showed.
+r = import_csv(TOGGLE, "toggle_commit.csv", date_col="0", desc_col="1",
+               mode="debitcredit", debit_col="3", credit_col="4")
+b"Imported 2 new" in r.data or fail("both rows should import under the switched mode")
+cents_list("FAKE TOGGLE HARDWARE") == [-521] or fail(
+    f"debit 5.21 stored as {cents_list('FAKE TOGGLE HARDWARE')}, expected [-521]")
+cents_list("FAKE TOGGLE REFUND") == [1000] or fail(
+    f"credit 10.00 stored as {cents_list('FAKE TOGGLE REFUND')}, expected [1000]")
+
+r = import_csv(REVERSE, "reverse_commit.csv", date_col="0", desc_col="1",
+               mode="single", amount_col="4", sign="negative")
+b"Imported 2 new" in r.data or fail("both rows should import under the single column")
+cents_list("FAKE REVERSE GROCER") == [-1234] or fail(
+    f"-12.34 stored as {cents_list('FAKE REVERSE GROCER')}, expected [-1234]")
+cents_list("FAKE REVERSE PAYCHECK") == [50000] or fail(
+    f"500.00 stored as {cents_list('FAKE REVERSE PAYCHECK')}, expected [50000]")
+
+# ...and re-importing that same file under its OWN detected debit/credit mapping
+# is all duplicates: the two modes read the file to the same cents, which is the
+# switch being cosmetic to the ledger and nothing more.
+r = import_csv(REVERSE, "reverse_detected.csv")
+b"Imported 0 new" in r.data or fail(
+    f"the detected mapping should agree with the switched one: {r.data[-200:]}")
+cents_list("FAKE REVERSE GROCER") == [-1234] or fail(
+    f"the detected Debit column disagreed: {cents_list('FAKE REVERSE GROCER')}")
+
+# 22N. the toggle script is on the page, and it is the inline vanilla-JS kind:
+# no library, no CDN, nothing fetched.
+html = upload_csv(PLAIN, "script.csv").data
+b'id=map-form' in html or fail("the mapping form needs an id for the toggle script to find")
+b'input[name=mode]' in html or fail("the toggle script should read the money-style radios")
+b"[data-money]" in html or fail("the toggle script should select the money groups")
+b"src=" not in html.split(b"<script>")[-1] or fail(
+    "the mapping page must not load a script from anywhere")
+
+
+# ---------------------------------------------------------------------------
 # 23. Grouped categorize screen: set a merchant once, or make one row an
 # exception. Synthetic merchants only — never real statement data.
 # ---------------------------------------------------------------------------

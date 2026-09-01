@@ -246,6 +246,22 @@ def mapping_is_complete(m):
         else m["debit"] is None or m["credit"] is None))
 
 
+def cell(row, i):
+    """The cell at column `i`, or None if `i` isn't a usable index into the row.
+
+    Folds the short-row skip (what the old `except IndexError` caught) together
+    with a column the mapping never resolved. A missing column really is None —
+    a mapping submitted for a mode whose selects weren't filled in resolves that
+    way — and `row[None]` is a TypeError, which is not an unreadable row, it's a
+    500. Unreadable is the honest answer, so it is given in one place.
+    """
+    if not isinstance(i, int) or isinstance(i, bool):
+        return None
+    if not 0 <= i < len(row):
+        return None
+    return row[i]
+
+
 def read_row(row, m):
     """One data row under a mapping -> (date, desc, cents), or None if unreadable.
 
@@ -256,20 +272,25 @@ def read_row(row, m):
     anything new. The preview and the commit both go through here, so what you
     see on the mapping page is what gets written.
     """
-    try:
-        raw_date = row[m["date"]].strip()
-        desc = row[m["desc"]].strip()
-        if m["mode"] == "single":
-            cents = parse_amount_to_cents(row[m["amount"]])
-            # A statement that writes spending as positive numbers is the same
-            # file with every sign flipped; income keeps its own (opposite) sign.
-            if cents is not None and m.get("sign") == "positive":
-                cents = -cents
-        else:
-            cents = split_amount_to_cents(row[m["debit"]], row[m["credit"]])
-    except IndexError:
+    raw_date, raw_desc = cell(row, m["date"]), cell(row, m["desc"])
+    if raw_date is None or raw_desc is None:
         return None
-    date = normalize_date(raw_date)
+    desc = raw_desc.strip()
+    if m["mode"] == "single":
+        raw_amount = cell(row, m["amount"])
+        if raw_amount is None:
+            return None
+        cents = parse_amount_to_cents(raw_amount)
+        # A statement that writes spending as positive numbers is the same
+        # file with every sign flipped; income keeps its own (opposite) sign.
+        if cents is not None and m.get("sign") == "positive":
+            cents = -cents
+    else:
+        raw_debit, raw_credit = cell(row, m["debit"]), cell(row, m["credit"])
+        if raw_debit is None or raw_credit is None:
+            return None
+        cents = split_amount_to_cents(raw_debit, raw_credit)
+    date = normalize_date(raw_date.strip())
     if cents is None or not desc or date is None:
         return None
     return date, desc, cents
@@ -1130,25 +1151,57 @@ def column_select(name, headers, chosen):
     return f"<select name={name}>{opts}</select>"
 
 
+# What each money column's header tends to be called, for the fallback below.
+MONEY_KEYWORDS = {"amount": ("amount", "amt", "value"),
+                  "debit": ("debit", "withdrawal", "charge", "out"),
+                  "credit": ("credit", "deposit", "in")}
+
+
+def money_column(chosen, headers, field, avoid=None):
+    """A real column index for a money select — never None.
+
+    Both money groups are always on the page, so a select for the mode the user
+    isn't in still has to name a column: a <select> rendered with nothing chosen
+    submits its first option anyway, and the page would then be showing one
+    mapping while submitting another. Order is what was picked or detected, then
+    a keyword guess off the file's own header, then the first column that isn't
+    already spoken for. `avoid` keeps Credit off Debit's column.
+    """
+    if isinstance(chosen, int) and not isinstance(chosen, bool) \
+            and 0 <= chosen < len(headers):
+        return chosen
+    for i, h in enumerate(headers):
+        if i != avoid and any(k in h.strip().lower() for k in MONEY_KEYWORDS[field]):
+            return i
+    return 1 if avoid == 0 and len(headers) > 1 else 0
+
+
 def mapping_body(token, stash, m):
     """The mapping + preview screen. Renders, never writes."""
     headers, data = stash["header"], stash["data"]
 
-    if m["mode"] == "single":
-        signopts = "".join(
-            f"<option value={v} {'selected' if m.get('sign') == v else ''}>{label}</option>"
-            for v, label in SIGN_CHOICES)
-        money_fields = f"""
+    # Both money groups render whatever the mode is — the script below hides the
+    # one you aren't using. Rendering only the active group meant switching the
+    # radio submitted a mode whose columns weren't on the page at all.
+    signopts = "".join(
+        f"<option value={v} {'selected' if m.get('sign') == v else ''}>{label}</option>"
+        for v, label in SIGN_CHOICES)
+    amount_i = money_column(m["amount"], headers, "amount")
+    debit_i = money_column(m["debit"], headers, "debit")
+    credit_i = money_column(m["credit"], headers, "credit", avoid=debit_i)
+    money_fields = f"""
+        <div class=field data-money=single>
           <span><label class=lbl>Amount column</label>
-            {column_select('amount_col', headers, m['amount'])}</span>
+            {column_select('amount_col', headers, amount_i)}</span>
           <span><label class=lbl>Spending shows as</label>
-            <select name=sign>{signopts}</select></span>"""
-    else:
-        money_fields = f"""
+            <select name=sign>{signopts}</select></span>
+        </div>
+        <div class=field data-money=debitcredit>
           <span><label class=lbl>Debit column</label>
-            {column_select('debit_col', headers, m['debit'])}</span>
+            {column_select('debit_col', headers, debit_i)}</span>
           <span><label class=lbl>Credit column</label>
-            {column_select('credit_col', headers, m['credit'])}</span>"""
+            {column_select('credit_col', headers, credit_i)}</span>
+        </div>"""
 
     modes = "".join(
         f"<label><input type=radio name=mode value={v} "
@@ -1178,7 +1231,7 @@ def mapping_body(token, stash, m):
       <p class=sub>{esc(stash['filename'])} — nothing has been imported yet.
          Adjust anything that looks wrong, preview it, then import.</p>
       {prenote}
-      <form method=post class=rev>
+      <form method=post class=rev id=map-form>
         <input type=hidden name=token value="{esc(token)}">
         <input type=hidden name=account_id value="{stash['account_id']}">
         <div class=field>
@@ -1189,7 +1242,7 @@ def mapping_body(token, stash, m):
         </div>
         <div class=field><label class=lbl>Money style</label>
           <span class=radio>{modes}</span></div>
-        <div class=field>{money_fields}</div>
+        {money_fields}
         <h2>Preview</h2>
         <table><tr><th>Date</th><th>Description</th><th class=r>Amount</th></tr>
           {prows}</table>
@@ -1197,7 +1250,34 @@ def mapping_body(token, stash, m):
           <button class='btn ghost' formaction="{url_for('preview_import')}">Update preview</button>
           <button class=btn formaction="{url_for('commit_import')}">Import</button>
         </div>
-      </form>"""
+      </form>
+      <script>
+      /* Money style toggle — show the field group for the checked style only.
+
+         Vanilla JS, inline, no libraries: same rules as the Transactions grid.
+         Both groups are server-rendered VISIBLE, so with JS off the page still
+         works — you fill in the pair you mean and import; nothing here is
+         load-bearing. All this does is hide the group you aren't using, and
+         switch without a round-trip to the server. */
+      (function () {{
+        var form = document.getElementById("map-form");
+        if (!form) return;
+        var radios = form.querySelectorAll("input[name=mode]");
+        var groups = form.querySelectorAll("[data-money]");
+        function show() {{
+          var mode = "single", i;
+          for (i = 0; i < radios.length; i++)
+            if (radios[i].checked) mode = radios[i].value;
+          for (i = 0; i < groups.length; i++)
+            /* "" not "block": .field is a flex row in the stylesheet. */
+            groups[i].style.display =
+              groups[i].getAttribute("data-money") === mode ? "" : "none";
+        }}
+        for (var k = 0; k < radios.length; k++)
+          radios[k].addEventListener("change", show);
+        show();
+      }})();
+      </script>"""
 
 
 EXPIRED = "That upload expired — please choose the file again."
