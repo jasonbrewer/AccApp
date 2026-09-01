@@ -115,44 +115,35 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 """
 
-# Broad, stable categories — deliberately few (transcript: 15-30, not a deep tree).
+# A near-empty starting chart. A fresh book opens on THREE categories, and the
+# user builds their own tree from there on /categories — an accounting chart is
+# a personal thing, and twenty opinionated spending buckets are twenty someone
+# else's guesses to delete before you can start.
+#
+# What is left is structural rather than opinionated: money in, money moved
+# between your own accounts, and the system fallback. Nothing here says
+# anything about how you spend.
+#
+#   - "Income"        money in, as opposed to spending
+#   - "Transfer"      an internal move, neither income nor spending
+#   - "Uncategorized" the system fallback leaf. NON-NEGOTIABLE: every picker,
+#                     the importer and resolve_leaf() fall back to it by name,
+#                     and it is locked against rename/move/delete/children.
+#
+# All three seed at top level (parent_id NULL), so a fresh book is three leaves.
 SEED_CATEGORIES = [
     # name, kind, use_default
-    ("Equipment",              "variable", "business"),
-    ("Software & Subscriptions","fixed",   "business"),
-    ("Office Supplies",        "variable", "business"),
-    ("Advertising & Marketing","variable", "business"),
-    ("Professional Services",  "variable", "business"),
-    ("Shipping",               "variable", "business"),
-    ("Office Rent",            "fixed",    "business"),
-    ("Meals",                  "variable", "business"),
-    ("Travel",                 "variable", "either"),
-    ("Gas / Vehicle",          "variable", "either"),
-    ("Utilities / Phone",      "fixed",    "either"),
-    ("Insurance",              "fixed",    "either"),
-    ("Groceries",              "variable", "personal"),
-    ("Dining",                 "optional", "personal"),
-    ("Household",              "variable", "personal"),
-    ("Entertainment",          "optional", "personal"),
-    ("Health",                 "variable", "personal"),
-    ("Mortgage / Rent",        "fixed",    "personal"),
-    ("Shopping",               "optional", "personal"),
-    ("Pets",                   "variable", "personal"),
     ("Income",                 "variable", "either"),
     ("Transfer",               "variable", "either"),
     ("Uncategorized",          "variable", "either"),
 ]
 
-# A few starter rules so you can see rule-first categorization working immediately.
-# The app LEARNS the rest from your confirmations.
-SEED_RULES = [
-    ("ADOBE",      "Software & Subscriptions"),
-    ("BH PHOTO",   "Equipment"),
-    ("VERIZON",    "Utilities / Phone"),
-    ("WAWA",       "Gas / Vehicle"),
-    ("SHELL",      "Gas / Vehicle"),
-    ("NETFLIX",    "Entertainment"),
-]
+# No starter rules ship. A rule has to point at a category, and the only
+# categories left are ones no merchant belongs to — a seeded rule would either
+# name a category that no longer exists or teach an opinion the user never
+# asked for. The learning loop is unchanged: confirm a merchant on Categorize
+# (or Review) and the rule is written then, from the user's own decision.
+SEED_RULES = []
 
 SEED_ACCOUNTS = [
     ("Business Checking", "bank",   "business"),

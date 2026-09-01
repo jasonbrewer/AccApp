@@ -111,8 +111,16 @@ newer OS or that won't run on Ventura.
 - Merchant matching uses `normalize_merchant()` (strips store #s / noise, keeps
   ~2 leading words). Rule lookup matches exact OR rule-is-a-leading-prefix, most
   specific (longest) rule wins.
-- Categories are broad and few (see `SEED_CATEGORIES`) — tags/aliases over deep
-  trees. Don't proliferate categories.
+- Categories are broad and few — tags/aliases over deep trees. Don't
+  proliferate categories.
+- **A fresh book ships a near-empty chart.** `SEED_CATEGORIES` is three
+  structural categories — `Income`, `Transfer` and the `Uncategorized` system
+  leaf — and `SEED_RULES` is **empty**. No opinionated spending categories and
+  no merchant rules ship: the chart of accounts is the user's, built on
+  `/categories`, and a shipped rule would teach an opinion they never gave.
+  The learning loop is unchanged — confirming a merchant on Categorize (or
+  Review) writes the rule then, from the user's own decision. Tests that need a
+  fuller chart build one as a fixture; don't add seeds to make a test pass.
 - **Categories nest.** A category may have a `parent_id` (NULL = top level).
   One with at least one child is a **heading**; one with no children is a
   **leaf**. The shape is managed on `/categories`; the seeds stay flat, so a
