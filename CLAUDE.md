@@ -34,8 +34,16 @@ newer OS or that won't run on Ventura.
   `Categorizer.categorize()` runs rule → local Ollama → fallback. Keep all model
   logic here. If the project ever targets the Mac App Store, this single file gets
   swapped for a bundled on-device model and nothing else changes.
-- **`app.py` — the local web UI.** Flask, server-rendered. Import, two-at-a-time
-  review, transactions, dashboard.
+- **`app.py` — the local web UI.** Flask, server-rendered, with one
+  client-interactive surface. Import, two-at-a-time review, transactions,
+  dashboard. The Transactions grid is enhanced with a small amount of vanilla JS
+  (inline, no libraries, no CDN, localhost only) for inline editing with
+  autosave; every other page is plain server-rendered HTML, and the grid still
+  renders read-only with JS off.
+- **The Transactions grid never teaches.** It is a deliberate non-teaching
+  corrections surface — editing a row there fixes that row and writes no
+  `merchant_rules` entry. Merchant-rule learning lives on the Categorize page
+  (and `/review`), where the user is deciding for a whole merchant on purpose.
 
 ## Invariants — do not break these
 

@@ -764,7 +764,7 @@ conn.executemany(
 conn.commit()
 
 page_html = client.get("/transactions").data.decode()
-head = page_html[page_html.index("<table>"):page_html.index("</tr>")]
+head = page_html[page_html.index("<table id="):page_html.index("</tr>")]
 "Debit" in head and "Credit" in head or fail(
     "the transactions header should carry Debit and Credit columns")
 ">Amount<" not in head or fail("the lone Amount header should be gone")
@@ -787,8 +787,9 @@ def rendered_rows(query=""):
     r = client.get("/transactions" + query)
     r.status_code == 200 or fail(f"/transactions{query} returned {r.status_code}")
     body = r.data.decode()
-    body = body[body.index("<table>"):]
-    return re.findall(r"<tr><td>(\d{4}-\d{2}-\d{2})</td><td>(.*?)</td>", body)
+    body = body[body.index("<table id="):]
+    # rows now carry data-* hooks for the inline editor
+    return re.findall(r"<tr data-id='\d+'[^>]*><td>(\d{4}-\d{2}-\d{2})</td><td>(.*?)</td>", body)
 
 
 def rendered_cents(query=""):
@@ -844,6 +845,180 @@ dates_asc == sorted(dates_asc) or fail("date asc is not ascending")
     "the active column should carry an ascending arrow")
 "Date ▼" in client.get("/transactions").data.decode() or fail(
     "the default page should mark Date as sorted descending")
+
+# 25. transactions grid: inline editing via POST /transactions/update
+#
+# The rule this whole surface is built around: the grid CORRECTS a row, it never
+# TEACHES a merchant. Rule learning belongs to /review and /categorize.
+import json as J  # noqa: E402
+
+conn.execute(
+    """INSERT INTO transactions
+       (account_id, txn_date, description, merchant_norm, amount_cents,
+        dedup_key, created_at, category_source)
+       VALUES (1,'2026-07-01','GRIDEDIT SUPPLY CO','GRIDEDIT SUPPLY',
+               -4200,'grid-edit-1','now','none')""")
+conn.commit()
+grid_id = conn.execute(
+    "SELECT id FROM transactions WHERE dedup_key='grid-edit-1'").fetchone()["id"]
+
+
+def txn(tid):
+    return conn.execute(
+        """SELECT t.*, c.name catname FROM transactions t
+             LEFT JOIN categories c ON c.id=t.category_id WHERE t.id=?""",
+        (tid,)).fetchone()
+
+
+def update(**form):
+    return client.post("/transactions/update", data=form)
+
+
+def rules_count():
+    return conn.execute("SELECT COUNT(*) n FROM merchant_rules").fetchone()["n"]
+
+
+# 25A. THE MARQUEE TEST — a category edit on the grid teaches nothing.
+before_rules = rules_count()
+r = update(id=grid_id, category="Office Supplies")
+r.status_code == 200 or fail(f"a category edit returned {r.status_code}")
+out = J.loads(r.data)
+out["ok"] is True or fail("a category edit should answer ok:true")
+out["category"] == "Office Supplies" or fail(f"response category was {out['category']}")
+out["reviewed"] == 1 or fail("a category edit should report the row reviewed")
+
+row = txn(grid_id)
+row["catname"] == "Office Supplies" or fail("the category edit did not store the category")
+row["category_source"] == "user" or fail(
+    f"a grid category edit must be category_source='user', got {row['category_source']}")
+row["reviewed"] == 1 or fail("a grid category edit must mark the row reviewed")
+
+rules_count() == before_rules or fail(
+    "editing a category on the grid must NOT create a merchant rule")
+conn.execute("SELECT COUNT(*) n FROM merchant_rules WHERE merchant_norm=?",
+             ("GRIDEDIT SUPPLY",)).fetchone()["n"] == 0 or fail(
+    "the grid taught a merchant_rules row for GRIDEDIT SUPPLY — it must never teach")
+
+# 25B. an unknown category name lands on Uncategorized, not an error
+J.loads(update(id=grid_id, category="Not A Real Category").data)["category"] \
+    == "Uncategorized" or fail("an unknown category name should fall back to Uncategorized")
+txn(grid_id)["catname"] == "Uncategorized" or fail(
+    "the unknown-category fallback was not stored")
+rules_count() == before_rules or fail("the fallback path taught a merchant rule")
+
+# 25C. use=bogus falls back to the account default; use=personal is honored.
+#      Neither touches `reviewed`.
+account_default = conn.execute(
+    "SELECT default_use FROM accounts WHERE id=1").fetchone()["default_use"]
+conn.execute("UPDATE transactions SET reviewed=0, use=NULL WHERE id=?", (grid_id,))
+conn.commit()
+
+out = J.loads(update(id=grid_id, use="bogus").data)
+out["use"] == account_default or fail(
+    f"use=bogus should fall back to the account default, got {out['use']}")
+txn(grid_id)["use"] == account_default or fail("the use fallback was not stored")
+txn(grid_id)["reviewed"] == 0 or fail("a use edit must not mark the row reviewed")
+
+out = J.loads(update(id=grid_id, use="personal").data)
+out["use"] == "personal" or fail(f"use=personal was not honored, got {out['use']}")
+txn(grid_id)["use"] == "personal" or fail("use=personal was not stored")
+txn(grid_id)["reviewed"] == 0 or fail("a use edit must not change reviewed")
+
+# ...and a use edit on an already-reviewed row leaves it reviewed
+conn.execute("UPDATE transactions SET reviewed=1 WHERE id=?", (grid_id,))
+conn.commit()
+update(id=grid_id, use="business")
+txn(grid_id)["reviewed"] == 1 or fail("a use edit must not un-review a row")
+
+# 25D. a note-only edit saves the note (trimmed) and leaves reviewed alone
+conn.execute("UPDATE transactions SET reviewed=0 WHERE id=?", (grid_id,))
+conn.commit()
+out = J.loads(update(id=grid_id, note="  paper + toner  ").data)
+out["note"] == "paper + toner" or fail(f"the note should be stored trimmed, got {out['note']!r}")
+txn(grid_id)["note"] == "paper + toner" or fail("the note edit was not stored")
+txn(grid_id)["reviewed"] == 0 or fail("a note edit must not mark the row reviewed")
+rules_count() == before_rules or fail("a note edit taught a merchant rule")
+
+# 25E. only the fields sent are applied — a use edit leaves the note untouched
+update(id=grid_id, use="personal")
+txn(grid_id)["note"] == "paper + toner" or fail(
+    "a partial update wiped a field that wasn't in the form")
+
+# 25F. money, date, description, merchant_norm and dedup_key are never touched
+frozen = txn(grid_id)
+update(id=grid_id, category="Meals", use="business", note="everything at once")
+after = txn(grid_id)
+for col in ("amount_cents", "txn_date", "description", "merchant_norm", "dedup_key"):
+    after[col] == frozen[col] or fail(f"/transactions/update changed {col}")
+isinstance(after["amount_cents"], int) or fail("amount_cents stopped being an integer")
+
+# 25G. a missing or unknown id is a 404 that writes nothing
+snapshot = (conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"],
+            rules_count(), txn(grid_id)["note"])
+for bad in ({}, {"id": ""}, {"id": "999999", "note": "ghost"},
+            {"id": "not-a-number", "category": "Meals"}):
+    r = client.post("/transactions/update", data=bad)
+    r.status_code == 404 or fail(f"id={bad.get('id')!r} should be 404, got {r.status_code}")
+    J.loads(r.data)["ok"] is False or fail(f"id={bad.get('id')!r} should answer ok:false")
+(conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"],
+ rules_count(), txn(grid_id)["note"]) == snapshot or fail(
+    "a 404 update wrote something")
+
+# 25H. the page hands the editor its hooks: data-id rows and the category JSON
+grid_html = client.get("/transactions").data.decode()
+f"data-id='{grid_id}'" in grid_html or fail("rows should expose data-id for the editor")
+'data-field=\'category\'' in grid_html or fail("the category cell needs an edit hook")
+'data-field=\'use\'' in grid_html or fail("the use cell needs an edit hook")
+'data-field=\'note\'' in grid_html or fail("the note cell needs an edit hook")
+'id="txn-grid"' in grid_html or fail("the table should be addressable as #txn-grid")
+'<script type="application/json" id="cat-list">' in grid_html or fail(
+    "the category list should be embedded as a JSON block")
+
+start = grid_html.index('id="cat-list">') + len('id="cat-list">')
+embedded = J.loads(grid_html[start:grid_html.index("</script>", start)])
+embedded == D.category_names(conn) or fail(
+    "the embedded category list should be exactly the active category names")
+
+# ...and the read-only columns carry no edit hook
+grid_row = grid_html[grid_html.index(f"data-id='{grid_id}'"):]
+grid_row = grid_row[:grid_row.index("</tr>")]
+editable = grid_row.count("class='ed'")
+editable == 3 or fail(
+    f"exactly three cells are editable in this PR (category/use/note), found {editable}")
+"<td class='r num'>-$42.00</td>" in grid_row or fail(
+    "the debit cell should still render read-only")
+
+# 25I. injection guard: a note full of markup can't break the page or the JSON
+nasty = '</script><script>alert(1)</script> "quoted" & <b>bold</b>'
+update(id=grid_id, note=nasty)
+txn(grid_id)["note"] == nasty.strip() or fail("the hostile note was not stored verbatim")
+
+hostile = client.get("/transactions").data.decode()
+"<script>alert(1)</script>" not in hostile or fail(
+    "a note with markup reached the page unescaped")
+"&lt;script&gt;alert(1)&lt;/script&gt;" in hostile or fail(
+    "a note with markup should render escaped")
+
+# the embedded JSON block still parses, and `<` inside it is neutralized
+start = hostile.index('id="cat-list">') + len('id="cat-list">')
+block = hostile[start:hostile.index("</script>", start)]
+"<" not in block or fail("a raw < inside the embedded JSON could end the script early")
+J.loads(block) == D.category_names(conn) or fail(
+    "the embedded category JSON stopped parsing")
+
+# every <script> the page opens is closed exactly once — the note didn't add one
+hostile.count("<script") == hostile.count("</script>") or fail(
+    "the page's script tags no longer balance")
+
+# 25J. a category name containing < would still be escaped out of the JSON block
+J.loads(A.script_json(["Meals", "</script> & <b>"])) == ["Meals", "</script> & <b>"] \
+    or fail("script_json must round-trip through JSON unchanged")
+"<" not in A.script_json(["</script>"]) or fail(
+    "script_json must leave no raw < for the HTML parser to find")
+
+# 25K. and the whole no-teach promise, stated once more over every edit above
+rules_count() == before_rules or fail(
+    "some edit on the transactions grid taught a merchant rule")
 
 os.remove("_test.sqlite")
 print("ALL TESTS PASSED")
