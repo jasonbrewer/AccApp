@@ -34,12 +34,12 @@ newer OS or that won't run on Ventura.
   `Categorizer.categorize()` runs rule → local Ollama → fallback. Keep all model
   logic here. If the project ever targets the Mac App Store, this single file gets
   swapped for a bundled on-device model and nothing else changes.
-- **`app.py` — the local web UI.** Flask, server-rendered, with one
-  client-interactive surface. Import, two-at-a-time review, transactions,
-  dashboard. The Transactions grid is enhanced with a small amount of vanilla JS
-  (inline, no libraries, no CDN, localhost only) for inline editing with
-  autosave; every other page is plain server-rendered HTML, and the grid still
-  renders read-only with JS off.
+- **`app.py` — the local web UI.** Flask, **mostly** server-rendered: import,
+  two-at-a-time review, transactions, dashboard. One exception — the
+  Transactions page is a client-interactive grid. A small amount of vanilla JS
+  (inline, no libraries, no CDN, localhost only) adds inline cell editing with
+  autosave and multi-select + bulk actions on top of a table that still renders
+  and reads fine with JS off. Every other page is plain server-rendered HTML.
 - **The Transactions grid never teaches.** It is a deliberate non-teaching
   corrections surface — editing a row there fixes that row and writes no
   `merchant_rules` entry. Merchant-rule learning lives on the Categorize page
@@ -69,6 +69,11 @@ newer OS or that won't run on Ventura.
    `ollama_lookup`.)
 5. **One SQLite file per year** (`ledger_YYYY.sqlite`). Don't merge years into
    one file.
+   - Note: saved column-import profiles are deliberately kept OUTSIDE the yearly
+     file. They live in a single local JSON file next to `app.py` — path from
+     the `LEDGER_PROFILES` env var, default `localledger_profiles.json`. A
+     bank's CSV layout belongs to the bank, not to a year, so profiles are
+     global across years; the DB schema is unaffected by them.
 6. **The categorizer boundary stays clean.** UI and DB code must not call Ollama
    directly — go through `Categorizer`.
 7. **Import is idempotent.** Re-importing an overlapping statement must not create
@@ -81,8 +86,14 @@ newer OS or that won't run on Ventura.
    - `merchant_norm`, by contrast, IS recomputed from an edited description: it
      is a live matching key derived from the text, not an identity. Deriving it
      writes no `merchant_rules` row — the grid still never teaches.
+   - Both notes above are the grid's half of the bargain with invariant 8: a
+     correction there is a correction, never a lesson. See the note under 8.
 8. **Confirmations teach rules.** When the user sets a category in review, upsert
    a `merchant_rules` row so it's rule-matched next time. Keep this learning loop.
+   - Note: teaching happens on Categorize and Review, and only there. The
+     Transactions grid is a non-teaching corrections surface — editing a cell,
+     or bulk-setting a category/use across the rows you ticked, stamps those
+     rows and NEVER writes a `merchant_rules` entry. Tests enforce it.
 
 ## Conventions
 
