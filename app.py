@@ -14,18 +14,25 @@ Milestone 1 (this build): accounts, CSV import + duplicate detection,
 rule-first + optional-Ollama categorization, two-at-a-time review that learns
 from your confirmations, and a spending dashboard.
 Next milestones: transfers, splits, the Monthly Nut, and the document dump / OCR.
+
+Pages are server-rendered. The one exception is the Transactions grid, which is
+client-interactive: a small amount of vanilla JS (no libraries, no CDN, all of
+it inline and local) adds inline editing of category / use / note with autosave.
+That grid is a deliberate non-teaching corrections surface — editing a row there
+never writes a merchant_rule. Rule learning lives on Categorize (and /review).
 """
 
 import csv
 import html
 import io
+import json
 import os
 import secrets
 import sqlite3
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from flask import Flask, request, redirect, url_for, render_template_string
+from flask import Flask, request, redirect, url_for, render_template_string, jsonify
 
 import db
 from categorizer import Categorizer, normalize_merchant, ollama_available
@@ -350,6 +357,25 @@ BASE = """
     display:flex;flex-direction:column;gap:14px;max-width:520px}
   .status{font-size:13px;padding:6px 10px;border-radius:8px}
   .status.on{background:#e7f2ec;color:var(--settled)} .status.off{background:#f0eee8;color:var(--muted)}
+  /* --- transactions grid: inline editing (category / use / note) --- */
+  td.ed{cursor:pointer;position:relative}
+  td.ed:hover{background:#f6f4ee;box-shadow:inset 0 0 0 1px var(--line)}
+  td.ed:focus{outline:2px solid var(--accent);outline-offset:-2px}
+  td.ed .ph{color:var(--muted)}
+  /* the table clips to its radius; the grid must let the dropdown out */
+  #txn-grid{overflow:visible}
+  #txn-grid tr:first-child th:first-child{border-top-left-radius:12px}
+  #txn-grid tr:first-child th:last-child{border-top-right-radius:12px}
+  tr.saving td{opacity:.5}
+  tr.stale td{background:#fbeeec}
+  .cbx{position:relative}
+  .cbx input[type=text],td.ed input[type=text]{min-width:0;width:100%;padding:4px 6px;font-size:14px}
+  .cbx-list{position:absolute;z-index:30;left:0;top:calc(100% + 3px);margin:0;padding:4px;
+    list-style:none;min-width:200px;max-height:230px;overflow:auto;background:var(--card);
+    border:1px solid var(--line);border-radius:9px;box-shadow:0 8px 22px rgba(28,36,51,.14)}
+  .cbx-list li{padding:5px 8px;border-radius:6px;font-size:13px;white-space:nowrap;cursor:pointer}
+  .cbx-list li.on{background:var(--ink);color:var(--paper)}
+  .cbx-list li.none{color:var(--muted);cursor:default}
 </style></head><body>
 <header><div class=bar>
   <div class=brand>LocalLedger <span>· {{ year }}</span></div>
@@ -362,6 +388,285 @@ BASE = """
   </nav>
 </div></header>
 <main>{{ body|safe }}</main>
+<script>
+/* Transactions grid — inline editing of category / use / note.
+
+   Vanilla JS, no libraries, no CDN, no page reload. The table itself is
+   rendered by the server and stays readable with JS off; this only adds
+   editing on top of it.
+
+   One shared editor is moved between cells by event delegation rather than a
+   widget per row, so a grid with thousands of rows costs three DOM nodes.
+
+   This surface deliberately does NOT teach merchant rules — it corrects one
+   row at a time. Rule learning lives on the Categorize page.  */
+(function () {
+  var grid = document.getElementById("txn-grid");
+  if (!grid) return;
+
+  var SAVE_URL = "{{ url_for('transactions_update') }}";
+  var src = document.getElementById("cat-list");
+  var CATS = src ? JSON.parse(src.textContent) : [];
+
+  /* A category is its bare name today. When categories nest, this is the only
+     place that has to learn to say "Parent > Child" — the filter, the list and
+     the cell all read whatever it returns. */
+  function label(name) { return name; }
+
+  /* ---- the two shared editors ---- */
+  var box = document.createElement("div");
+  box.className = "cbx";
+  var catInput = document.createElement("input");
+  catInput.type = "text";
+  catInput.autocomplete = "off";
+  catInput.setAttribute("aria-label", "Category");
+  var list = document.createElement("ul");
+  list.className = "cbx-list";
+  box.appendChild(catInput);
+  box.appendChild(list);
+
+  var noteInput = document.createElement("input");
+  noteInput.type = "text";
+  noteInput.autocomplete = "off";
+  noteInput.setAttribute("aria-label", "Note");
+
+  var open = null;      // {cell, field, html} while an editor is mounted
+  var matches = [];
+  var hi = -1;
+
+  /* ---- painting from server truth ---- */
+  function cellOf(tr, field) {
+    return tr.querySelector("td.ed[data-field='" + field + "']");
+  }
+
+  function usePill(use) {
+    // `use` came back from the server, already narrowed to business|personal.
+    return use === "business"
+      ? "<span class='pill b'>Business</span>"
+      : "<span class='pill p'>Personal</span>";
+  }
+
+  function statusPill(reviewed) {
+    return reviewed
+      ? "<span class='pill settled'>Reviewed</span>"
+      : "<span class='pill review'>Needs review</span>";
+  }
+
+  function setNote(cell, note) {
+    cell.textContent = "";
+    if (note) {
+      cell.textContent = note;          // textContent, never innerHTML
+    } else {
+      var ph = document.createElement("span");
+      ph.className = "ph";
+      ph.textContent = "—";
+      cell.appendChild(ph);
+    }
+  }
+
+  function paint(tr, d) {
+    tr.dataset.category = d.category;
+    tr.dataset.use = d.use;
+    tr.dataset.note = d.note;
+    var c = cellOf(tr, "category");
+    if (c) c.textContent = label(d.category);
+    var u = cellOf(tr, "use");
+    if (u) u.innerHTML = usePill(d.use);
+    var n = cellOf(tr, "note");
+    if (n) setNote(n, d.note);
+    var s = tr.querySelector("td.status");
+    if (s) s.innerHTML = statusPill(d.reviewed);
+  }
+
+  function save(tr, field, value) {
+    var body = new URLSearchParams();
+    body.append("id", tr.dataset.id);
+    body.append(field, value);
+    tr.classList.remove("stale");
+    tr.classList.add("saving");
+    fetch(SAVE_URL, {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: body.toString()
+    }).then(function (r) {
+      return r.ok ? r.json() : null;
+    }).then(function (d) {
+      tr.classList.remove("saving");
+      if (d && d.ok) { paint(tr, d); } else { stale(tr); }
+    }).catch(function () {
+      tr.classList.remove("saving");
+      stale(tr);
+    });
+  }
+
+  function stale(tr) {
+    // Never leave a cell showing a value the database didn't accept.
+    tr.classList.remove("saving");
+    tr.classList.add("stale");
+    tr.title = "Not saved — reload the page.";
+  }
+
+  /* ---- editor plumbing ---- */
+  function closeEditor() {
+    if (!open) return null;
+    var o = open;
+    open = null;
+    o.cell.innerHTML = o.html;   // save() repaints from the response
+    return o;
+  }
+
+  /* ---- category: type-ahead combobox ---- */
+  function filter(q) {
+    var needle = q.trim().toLowerCase();
+    matches = CATS.filter(function (name) {
+      return !needle || label(name).toLowerCase().indexOf(needle) !== -1;
+    });
+    hi = matches.length ? 0 : -1;
+    draw();
+  }
+
+  function draw() {
+    list.textContent = "";
+    if (!matches.length) {
+      var none = document.createElement("li");
+      none.className = "none";
+      none.textContent = "No matching category";
+      list.appendChild(none);
+      return;
+    }
+    matches.forEach(function (name, i) {
+      var li = document.createElement("li");
+      li.textContent = label(name);
+      li.setAttribute("data-name", name);
+      if (i === hi) li.className = "on";
+      list.appendChild(li);
+    });
+    if (hi >= 0 && list.children[hi].scrollIntoView) {
+      list.children[hi].scrollIntoView({block: "nearest"});
+    }
+  }
+
+  function openCategory(cell) {
+    closeEditor();
+    var tr = cell.parentNode;
+    open = {cell: cell, field: "category", html: cell.innerHTML};
+    cell.textContent = "";
+    cell.appendChild(box);
+    catInput.value = "";
+    catInput.placeholder = tr.getAttribute("data-category") || "";
+    filter("");
+    catInput.focus();
+  }
+
+  function chooseCategory(name) {
+    if (!open || open.field !== "category") return;
+    var tr = open.cell.parentNode;
+    closeEditor();
+    save(tr, "category", name);
+    // Straight down the column: the next row is almost always the next edit.
+    var next = tr.nextElementSibling;
+    var target = next && cellOf(next, "category");
+    if (target) target.focus();
+  }
+
+  catInput.addEventListener("input", function () { filter(catInput.value); });
+
+  catInput.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!matches.length) return;
+      hi = (hi + (e.key === "ArrowDown" ? 1 : matches.length - 1)) % matches.length;
+      draw();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      // Only a highlighted, real category can be chosen. Free text never saves.
+      if (hi >= 0) chooseCategory(matches[hi]);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      var o = closeEditor();
+      if (o) o.cell.focus();
+    }
+  });
+
+  catInput.addEventListener("blur", function () {
+    if (open && open.field === "category") closeEditor();
+  });
+
+  // Swallow the mousedown so the input never loses focus — no blur, so the
+  // editor is still standing when the click lands on the item below.
+  list.addEventListener("mousedown", function (e) { e.preventDefault(); });
+
+  list.addEventListener("click", function (e) {
+    var li = e.target.closest("li[data-name]");
+    if (li) chooseCategory(li.getAttribute("data-name"));
+  });
+
+  /* ---- note: plain inline input ---- */
+  function openNote(cell) {
+    closeEditor();
+    var tr = cell.parentNode;
+    open = {cell: cell, field: "note", html: cell.innerHTML};
+    cell.textContent = "";
+    cell.appendChild(noteInput);
+    noteInput.value = tr.getAttribute("data-note") || "";
+    noteInput.focus();
+    noteInput.select();
+  }
+
+  function commitNote() {
+    if (!open || open.field !== "note") return;
+    var tr = open.cell.parentNode;
+    var value = noteInput.value;
+    closeEditor();
+    if (value.trim() !== (tr.getAttribute("data-note") || "")) save(tr, "note", value);
+  }
+
+  noteInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitNote();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      // closeEditor() clears `open`, so the blur that follows is a no-op.
+      var o = closeEditor();
+      if (o) o.cell.focus();
+    }
+  });
+
+  noteInput.addEventListener("blur", commitNote);
+
+  /* ---- one delegated listener for the whole grid ---- */
+  function edit(cell) {
+    var field = cell.getAttribute("data-field");
+    if (field === "use") {
+      var tr = cell.parentNode;
+      save(tr, "use", tr.getAttribute("data-use") === "business" ? "personal" : "business");
+    } else if (field === "category") {
+      openCategory(cell);
+    } else if (field === "note") {
+      openNote(cell);
+    }
+  }
+
+  grid.addEventListener("click", function (e) {
+    // A pick from the dropdown bubbles through the cell it belongs to; it is
+    // the selection, not a fresh click on that cell.
+    if (e.target.closest(".cbx")) return;
+    var cell = e.target.closest("td.ed");
+    if (!cell) return;
+    if (open && open.cell === cell) return;   // a click inside the live editor
+    edit(cell);
+  });
+
+  grid.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    if (!e.target.getAttribute || e.target.getAttribute("data-field") === null) return;
+    if (open && open.cell === e.target) return;
+    e.preventDefault();
+    edit(e.target);
+  });
+})();
+</script>
 </body></html>
 """
 
@@ -1083,6 +1388,21 @@ def sort_header(label, key, default_dir, sort, direction, cls=""):
     return f"<th{cls}><a href='{href}'>{label}</a></th>"
 
 
+def script_json(value):
+    """JSON for embedding in a <script> block.
+
+    `<` is the only character that can end a script element early, so escaping
+    it as \\u003c (still valid JSON) neutralizes `</script>`, `<!--` and
+    `<script` in one move. Nothing else in the block can break out.
+    """
+    return json.dumps(value).replace("<", "\\u003c")
+
+
+def edit_cell(field, inner, extra=""):
+    """An editable grid cell. `inner` is already escaped by the caller."""
+    return f"<td class='ed'{extra} data-field='{field}' tabindex='0'>{inner}</td>"
+
+
 @app.route("/transactions")
 def transactions():
     conn = get_conn()
@@ -1102,33 +1422,106 @@ def transactions():
     trs = ""
     for t in rows:
         use = txn_use(t)
+        catname = t["catname"] or "Uncategorized"
         upill = f"<span class='pill {'b' if use=='business' else 'p'}'>{esc(use.title())}</span>"
         state = ("<span class='pill settled'>Reviewed</span>" if t["reviewed"]
                  else "<span class='pill review'>Needs review</span>")
-        note = (f"<div class=meta style='color:var(--muted);font-size:12px'>{esc(t['note'])}</div>"
-                if t["note"] else "")
+        note = esc(t["note"]) if t["note"] else "<span class=ph>—</span>"
         # One signed amount_cents, shown in two columns. Display only — storage
         # is unchanged, and the debit keeps its minus sign.
         cents = t["amount_cents"]
         debit = money(cents) if cents < 0 else ""
         credit = money(cents) if cents > 0 else ""
-        trs += (f"<tr><td>{esc(t['txn_date'])}</td>"
-                f"<td>{esc(t['description'])}{note}</td>"
-                f"<td>{esc(t['catname'] or 'Uncategorized')}</td>"
-                f"<td>{upill}</td><td>{state}</td>"
-                f"<td class='r num'>{debit}</td>"
+        # data-* carries the row's current values so the editor never has to
+        # parse them back out of the cells.
+        trs += (f"<tr data-id='{t['id']}' data-category=\"{esc(catname)}\""
+                f" data-use=\"{esc(use)}\" data-note=\"{esc(t['note'])}\">"
+                f"<td>{esc(t['txn_date'])}</td>"
+                f"<td>{esc(t['description'])}</td>"
+                + edit_cell("category", esc(catname))
+                + edit_cell("use", upill)
+                + f"<td class='status'>{state}</td>"
+                + edit_cell("note", note)
+                + f"<td class='r num'>{debit}</td>"
                 f"<td class='r num'>{credit}</td></tr>")
     # Debit opens on asc (biggest money out on top), Credit on desc (biggest in).
     heads = (sort_header("Date", "date", "desc", sort, direction)
              + sort_header("Description", "desc", "asc", sort, direction)
              + sort_header("Category", "cat", "asc", sort, direction)
-             + "<th>Use</th><th>Status</th>"
+             + "<th>Use</th><th>Status</th><th>Note</th>"
              + sort_header("Debit", "amount", "asc", sort, direction, cls=" class=r")
              + sort_header("Credit", "amount", "desc", sort, direction, cls=" class=r"))
+    # The picker's whole vocabulary, handed over once. No fetch, no round trip.
+    cats = script_json(db.category_names(conn))
     body = f"""<h1>Transactions</h1>
-      <p class=sub>{len(rows)} transactions in {YEAR}.</p>
-      <table><tr>{heads}</tr>{trs}</table>"""
+      <p class=sub>{len(rows)} transactions in {YEAR}. Click a category, use or
+      note to edit it — changes save as you go and stay on this row.</p>
+      <script type="application/json" id="cat-list">{cats}</script>
+      <table id="txn-grid"><tr>{heads}</tr>{trs}</table>"""
     return page(body, "txns")
+
+
+@app.route("/transactions/update", methods=["POST"])
+def transactions_update():
+    """Autosave one field of one row from the transactions grid.
+
+    Partial by design: only the fields actually present in the form are
+    written, so the grid can send `use` alone without disturbing a note.
+
+    This endpoint NEVER calls teach_merchant_rule. The grid is a corrections
+    surface — it fixes the row in front of you and says nothing about what the
+    merchant means. Teaching stays on /categorize and /review, where the user
+    is deliberately deciding for a whole merchant.
+
+    It also never touches amount_cents, txn_date, description, merchant_norm or
+    dedup_key: no money, no identity, no dedup. Same no-CSRF posture as every
+    other POST here — this is a single-user app bound to localhost.
+    """
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT t.id, a.default_use
+             FROM transactions t JOIN accounts a ON a.id=t.account_id
+            WHERE t.id=?""", (request.form.get("id", ""),)).fetchone()
+    if row is None:
+        return jsonify(ok=False, error="unknown transaction"), 404
+
+    sets, vals = [], []
+    if "category" in request.form:
+        cat_id = db.category_map(conn)
+        # An unknown name is not an error the user can see — it lands on
+        # Uncategorized, the same fallback the importer and /review use.
+        cid = cat_id.get(request.form["category"], cat_id["Uncategorized"])
+        sets += ["category_id=?", "category_source='user'", "reviewed=1"]
+        vals.append(cid)
+    if "use" in request.form:
+        use = request.form["use"]
+        if use not in VALID_USES:
+            # Same rule as /review: anything else would be stored and then
+            # silently dropped from the dashboard's business/personal totals.
+            use = row["default_use"]
+        sets.append("use=?")
+        vals.append(use)
+    if "note" in request.form:
+        sets.append("note=?")
+        vals.append(request.form["note"].strip())
+
+    if sets:
+        conn.execute(f"UPDATE transactions SET {', '.join(sets)} WHERE id=?",
+                     vals + [row["id"]])
+        conn.commit()
+
+    # Answer with what is actually stored, not with what was asked for, so the
+    # grid repaints from the database rather than from its own optimism.
+    saved = conn.execute(
+        """SELECT t.id, t.use, t.note, t.reviewed, a.default_use, c.name catname
+             FROM transactions t
+             JOIN accounts a ON a.id=t.account_id
+             LEFT JOIN categories c ON c.id=t.category_id
+            WHERE t.id=?""", (row["id"],)).fetchone()
+    return jsonify(ok=True, id=saved["id"],
+                   category=saved["catname"] or "Uncategorized",
+                   use=txn_use(saved), reviewed=saved["reviewed"],
+                   note=saved["note"])
 
 
 def normalize_date(raw):
