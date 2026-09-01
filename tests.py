@@ -47,6 +47,84 @@ r = client.get("/")
 r.status_code == 200 or fail("dashboard did not load")
 b"Import a statement" in r.data or fail("empty dashboard missing import prompt")
 
+# ---------------------------------------------------------------------------
+# The chart of accounts these tests work in.
+#
+# A fresh book now ships nearly empty — Income, Transfer and the Uncategorized
+# system leaf, and no merchant rules at all — because a chart of accounts is a
+# personal thing the user builds on /categories. Everything below is therefore
+# a FIXTURE: the categories and the learned rules a user would have in place
+# after a few sessions with this statement.
+#
+# This is deliberately the chart that used to ship, so every assertion further
+# down proves exactly what it always proved — rule-first categorization,
+# teaching, leaf-only assignment, the rollup — on data the TEST created rather
+# than on opinions the app shipped. What changed is where the data comes from,
+# never what is asserted about it.
+# ---------------------------------------------------------------------------
+FIXTURE_CATEGORIES = [
+    # name, kind, use_default
+    ("Equipment",              "variable", "business"),
+    ("Software & Subscriptions", "fixed",  "business"),
+    ("Office Supplies",        "variable", "business"),
+    ("Advertising & Marketing", "variable", "business"),
+    ("Professional Services",  "variable", "business"),
+    ("Shipping",               "variable", "business"),
+    ("Office Rent",            "fixed",    "business"),
+    ("Meals",                  "variable", "business"),
+    ("Travel",                 "variable", "either"),
+    ("Gas / Vehicle",          "variable", "either"),
+    ("Utilities / Phone",      "fixed",    "either"),
+    ("Insurance",              "fixed",    "either"),
+    ("Groceries",              "variable", "personal"),
+    ("Dining",                 "optional", "personal"),
+    ("Household",              "variable", "personal"),
+    ("Entertainment",          "optional", "personal"),
+    ("Health",                 "variable", "personal"),
+    ("Mortgage / Rent",        "fixed",    "personal"),
+    ("Shopping",               "optional", "personal"),
+    ("Pets",                   "variable", "personal"),
+]
+
+# Learned rules, as a user would have taught them by confirming these merchants.
+FIXTURE_RULES = [
+    ("ADOBE",      "Software & Subscriptions"),
+    ("BH PHOTO",   "Equipment"),
+    ("VERIZON",    "Utilities / Phone"),
+    ("WAWA",       "Gas / Vehicle"),
+    ("SHELL",      "Gas / Vehicle"),
+    ("NETFLIX",    "Entertainment"),
+]
+
+
+def build_chart(book, categories=FIXTURE_CATEGORIES, rules=FIXTURE_RULES):
+    """Plant a chart of accounts in `book`, the way a user would have built one.
+
+    Top-level leaves only, so the book is shaped exactly as a flat chart always
+    was; nesting is what the /categories tests do to it later.
+    """
+    for name, kind, use in categories:
+        book.execute(
+            "INSERT OR IGNORE INTO categories(name, kind, use_default) VALUES (?,?,?)",
+            (name, kind, use))
+    for merchant, catname in rules:
+        book.execute(
+            """INSERT OR IGNORE INTO merchant_rules(merchant_norm, category_id, updated_at)
+               VALUES (?,(SELECT id FROM categories WHERE name=?),?)""",
+            (merchant, catname, "2026-01-01T00:00:00"))
+    book.commit()
+    return book
+
+
+# A fresh book really is near-empty before the fixture lands on it.
+opening = A.get_conn()
+[r["name"] for r in opening.execute("SELECT name FROM categories ORDER BY name")] == \
+    ["Income", "Transfer", "Uncategorized"] or fail(
+    "a fresh book should open on Income, Transfer and Uncategorized alone")
+opening.execute("SELECT COUNT(*) n FROM merchant_rules").fetchone()["n"] == 0 or fail(
+    "a fresh book should ship no merchant rules at all")
+build_chart(opening)
+
 # 2. import sample; then re-import -> all duplicates
 
 # Import is two-phase: POST /import parses and shows a mapping page (writing
@@ -96,10 +174,12 @@ n == 20 or fail(f"expected 20 transactions, got {n}")
 bad = conn.execute("SELECT COUNT(*) n FROM transactions WHERE typeof(amount_cents)!='integer'").fetchone()["n"]
 bad == 0 or fail("amount_cents must always be integer")
 
-# 4. rule-first categorization fires deterministically (no Ollama needed)
+# 4. rule-first categorization fires deterministically (no Ollama needed).
+# The rules are the fixture's now that none ship, but the path under test is
+# the same one: merchant_norm -> merchant_rules -> category, no model involved.
 ruled = conn.execute("SELECT COUNT(*) n FROM transactions WHERE category_source='rule'").fetchone()["n"]
-ruled >= 8 or fail(f"expected >=8 rule matches from seeds, got {ruled}")
-print(f"seed rule matches on sample_statement.csv: {ruled}")
+ruled >= 8 or fail(f"expected >=8 rule matches from the fixture rules, got {ruled}")
+print(f"rule matches on sample_statement.csv: {ruled}")
 
 # 5. review confirms and LEARNS a rule for an unknown merchant
 gh = conn.execute("SELECT id, merchant_norm FROM transactions WHERE description LIKE 'GITHUB%'").fetchone()
@@ -2404,15 +2484,12 @@ os.path.exists(FRESH) and os.remove(FRESH)
 fresh = D.init_db(FRESH)
 {c[1] for c in fresh.execute("PRAGMA table_info(categories)")} == SCHEMA["categories"] \
     or fail("init_db does not create parent_id on a fresh file")
-# the seed set is UNCHANGED, and every seed is still a flat top-level LEAF
-{n for n, _, _ in D.SEED_CATEGORIES} == {
-    "Equipment", "Software & Subscriptions", "Office Supplies",
-    "Advertising & Marketing", "Professional Services", "Shipping", "Office Rent",
-    "Meals", "Travel", "Gas / Vehicle", "Utilities / Phone", "Insurance",
-    "Groceries", "Dining", "Household", "Entertainment", "Health",
-    "Mortgage / Rent", "Shopping", "Pets", "Income", "Transfer",
-    "Uncategorized"} or fail("the seed categories changed — trimming them is a later PR")
-len(D.SEED_RULES) == 6 or fail("the seed rules changed")
+# a fresh book ships a near-empty chart: three structural leaves, no rules
+[n for n, _, _ in D.SEED_CATEGORIES] == ["Income", "Transfer", "Uncategorized"] or fail(
+    f"the seed chart should be three structural categories: {D.SEED_CATEGORIES}")
+D.SEED_RULES == [] or fail("no merchant rules ship — the user teaches their own")
+D.SYSTEM_LEAF in {n for n, _, _ in D.SEED_CATEGORIES} or fail(
+    "Uncategorized is the system fallback — it must always seed")
 fresh.execute("SELECT COUNT(*) n FROM categories WHERE parent_id IS NOT NULL"
               ).fetchone()["n"] == 0 or fail("every seeded category must be top level")
 all(c["label"] == c["name"] for c in D.leaf_choices(fresh)) or fail(
@@ -2854,7 +2931,9 @@ sum(r[4] for r in spend_rows()[:-1] if r[1] == 0) == 39000 or fail(
 
 # 31D. FLAT COMPATIBILITY — with nothing nested, the category rows are exactly
 # what the pre-rollup dashboard produced, computed here the old way.
-flat = open_book("_test_flat.sqlite")
+# A fresh book ships three categories, so the flat chart under test is the
+# fixture's — flat is the point here, not which names are in it.
+flat = build_chart(open_book("_test_flat.sqlite"))
 seed = {r["name"]: r["id"] for r in flat.execute("SELECT id, name FROM categories")}
 for desc, cents, cat, use in (("F GROC", -4200, "Groceries", "personal"),
                               ("F GEAR", -99900, "Equipment", "business"),
@@ -2994,6 +3073,90 @@ for banned in ("onclick", "onchange", "addEventListener", "fetch("):
 A.DB_PATH = REAL_DB
 for leftover in ("_test_rollup.sqlite", "_test_flat.sqlite"):
     os.path.exists(leftover) and os.remove(leftover)
+
+
+# ---------------------------------------------------------------------------
+# 32A-32C. The near-empty starting chart.
+#
+# A fresh book opens on three structural categories — money in, an internal
+# move, and the system fallback — and no merchant rules at all, because a chart
+# of accounts is the user's to build. What it must NOT be is a broken book on
+# day one: every page renders, an import still works with no rules and no
+# model, and the learning loop starts from zero.
+# ---------------------------------------------------------------------------
+
+opening_book = open_book("_test_opening.sqlite")
+
+# 32A. exactly three categories, all top-level leaves, and zero rules
+[r["name"] for r in opening_book.execute("SELECT name FROM categories ORDER BY name")] == \
+    ["Income", "Transfer", "Uncategorized"] or fail(
+    "a fresh book should open on Income, Transfer and Uncategorized alone")
+opening_book.execute(
+    "SELECT COUNT(*) n FROM categories WHERE parent_id IS NOT NULL").fetchone()["n"] == 0 \
+    or fail("every seeded category is top level")
+all(D.is_leaf(opening_book, r["id"])
+    for r in opening_book.execute("SELECT id FROM categories")) or fail(
+    "every seeded category is a leaf — a fresh book has no headings")
+[c["label"] for c in D.leaf_choices(opening_book)] == \
+    ["Income", "Transfer", "Uncategorized"] or fail(
+    "all three should be assignable, labelled by their bare names")
+opening_book.execute("SELECT COUNT(*) n FROM merchant_rules").fetchone()["n"] == 0 or fail(
+    "no merchant rules ship — a seeded rule would be an opinion the user never gave")
+# the fallback the importer, every picker and resolve_leaf() lean on is there
+D.resolve_leaf(opening_book, D.SYSTEM_LEAF) or fail(
+    "Uncategorized must resolve as a leaf on a fresh book")
+
+# ...and it is still the locked system leaf, with nothing shipped to shield it
+unc_id = D.resolve_leaf(opening_book, D.SYSTEM_LEAF)
+for form in ({"action": "rename", "id": str(unc_id), "name": "Misc"},
+             {"action": "move", "id": str(unc_id), "parent_id": ""},
+             {"action": "delete", "id": str(unc_id)}):
+    html = client.post("/categories", data=form, follow_redirects=True).data.decode()
+    "system category" in html or fail(f"Uncategorized must still refuse {form['action']}")
+D.resolve_leaf(opening_book, D.SYSTEM_LEAF) == unc_id or fail(
+    "Uncategorized must be untouched by all of that")
+
+# 32B. every page renders on the near-empty book
+for path in ("/", "/import", "/transactions", "/categorize", "/categories", "/review"):
+    code = client.get(path).status_code
+    code == 200 or fail(f"{path} returned {code} on a fresh book")
+b"Import a statement" in client.get("/").data or fail(
+    "a fresh dashboard should still invite the first import")
+
+# 32C. day one works end to end: import with no rules and no model, then teach
+r = import_csv("Date,Description,Amount\n"
+               "03/02/2026,FRESH START COFFEE,-4.75\n"
+               "03/03/2026,FRESH START DEPOSIT,250.00\n", "day-one.csv")
+b"Imported 2 new" in r.data or fail("a fresh book must be able to import")
+landed = [(r["catname"], r["category_source"]) for r in opening_book.execute(
+    """SELECT c.name catname, t.category_source FROM transactions t
+         LEFT JOIN categories c ON c.id=t.category_id ORDER BY t.id""")]
+landed == [("Uncategorized", "none"), ("Uncategorized", "none")] or fail(
+    f"with no rules and no model everything lands on Uncategorized: {landed}")
+
+# the user builds a category, then teaches the merchant on it — the loop the
+# removed seed rules used to short-circuit, working from nothing
+client.post("/categories", data={"action": "add", "name": "Coffee"},
+            follow_redirects=True)
+D.resolve_leaf(opening_book, "Coffee") or fail("the user's first category should exist")
+first = opening_book.execute(
+    "SELECT id, merchant_norm FROM transactions ORDER BY id LIMIT 1").fetchone()
+client.post("/review", data={"txn_id": [str(first["id"])],
+                             f"cat_{first['id']}": "Coffee",
+                             f"use_{first['id']}": "business",
+                             f"note_{first['id']}": ""})
+taught = opening_book.execute(
+    """SELECT c.name catname FROM merchant_rules r JOIN categories c ON c.id=r.category_id
+        WHERE r.merchant_norm=?""", (first["merchant_norm"],)).fetchone()
+taught and taught["catname"] == "Coffee" or fail(
+    "confirming a merchant must still teach the rule on a book that shipped none")
+opening_book.execute("SELECT category_id FROM transactions WHERE id=?",
+                     (first["id"],)).fetchone()["category_id"] == \
+    D.resolve_leaf(opening_book, "Coffee") or fail(
+    "the confirmed transaction should sit on the category the user made")
+
+A.DB_PATH = REAL_DB
+os.path.exists("_test_opening.sqlite") and os.remove("_test_opening.sqlite")
 
 
 os.remove("_test.sqlite")
