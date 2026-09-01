@@ -68,7 +68,12 @@ CREATE TABLE IF NOT EXISTS import_batches (
     filename      TEXT NOT NULL,
     imported_at   TEXT NOT NULL,
     row_count     INTEGER NOT NULL DEFAULT 0,
-    dup_count     INTEGER NOT NULL DEFAULT 0
+    dup_count     INTEGER NOT NULL DEFAULT 0,
+    -- Absolute path of a natively-picked file, NULL for a browser upload (a
+    -- browser never tells us where the file really lives). Read only to reveal
+    -- the file in Finder and for the opt-in file delete on undo; nothing in the
+    -- ledger depends on it, so NULL is always a valid state.
+    source_path   TEXT
 );
 
 -- ---- stubs for later milestones (created now so no migration is needed) ----

@@ -40,6 +40,17 @@ newer OS or that won't run on Ventura.
   (inline, no libraries, no CDN, localhost only) adds inline cell editing with
   autosave and multi-select + bulk actions on top of a table that still renders
   and reads fine with JS off. Every other page is plain server-rendered HTML.
+- **The native file picker and Reveal in Finder are mac-only, and optional.**
+  `POST /import/choose` opens the macOS dialog (`osascript`, argv list) and runs
+  the chosen file through the same phase-1 parse/stash as the browser upload;
+  `POST /import/reveal` runs `open -R` on it. Off macOS both answer **501** and
+  the ordinary browser upload — which is never removed, and is the only path
+  that ever has to work — does the whole job. `import_batches.source_path`
+  stores the absolute path of a natively-picked file and is NULL for a browser
+  upload (a browser never reveals where a file lives). It is read for exactly
+  two things: Reveal in Finder, and the off-by-default "also delete the original
+  CSV" box on undo. Undo removes the ledger rows either way, first and
+  regardless — a file that won't delete can never keep an import in the book.
 - **The Transactions grid never teaches.** It is a deliberate non-teaching
   corrections surface — editing a row there fixes that row and writes no
   `merchant_rules` entry. Merchant-rule learning lives on the Categorize page
