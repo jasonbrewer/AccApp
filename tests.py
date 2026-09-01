@@ -2700,6 +2700,302 @@ cat_id("Fine") is None or fail("a child of a missing parent must not be created"
 set(CODES) == {200} or fail(f"a category route errored: {sorted(set(CODES))}")
 
 
+# ---------------------------------------------------------------------------
+# 31A-31H. The dashboard rollup and the path-based category sort.
+#
+# Every transaction sits on a LEAF (3a), so spending is MEASURED on the leaves
+# and a heading's figure is exactly the sum of what sits beneath it. A heading
+# row and its children's rows are the same money at two zoom levels — which is
+# why the grand total is the sum of the LEAVES and never the sum of the printed
+# rows, and why the tests below spend most of their effort on that one point.
+#
+# These run against their own throwaway books so the numbers are exact and owe
+# nothing to what sections 1-30 accumulated.
+# ---------------------------------------------------------------------------
+
+REAL_DB = A.DB_PATH
+
+
+def spend_rows(html=None):
+    """The Spending by category table as [(label, depth, business, personal, total)].
+
+    Cents are positive (money out), the way the rollup counts them. Depth comes
+    from the indent the page renders, and a top-level row carries no span at
+    all — which is exactly what the table looked like before this PR.
+    """
+    html = client.get("/").data.decode() if html is None else html
+    if "Spending by category" not in html:
+        return []
+    body = html[html.index("Spending by category"):]
+    body = body[:body.index("</table>")]
+    out = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body):
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", tr)
+        if len(cells) != 4:
+            continue
+        label, depth = cells[0], 0
+        nested = re.match(r"^<span style='padding-left:(\d+)px'>(.*)</span>$", label)
+        if nested:
+            depth, label = int(nested.group(1)) // 18, nested.group(2)
+        out.append((label, depth, -to_cents(cells[1]), -to_cents(cells[2]),
+                    -to_cents(cells[3])))
+    return out
+
+
+def open_book(path):
+    """Point the app at a throwaway ledger and hand back its connection."""
+    os.path.exists(path) and os.remove(path)
+    A.DB_PATH = path
+    return A.get_conn()
+
+
+def make_cat(book, name, parent=None):
+    book.execute("INSERT INTO categories(name, parent_id) VALUES (?,?)", (name, parent))
+    return book.execute("SELECT id FROM categories WHERE name=?", (name,)).fetchone()["id"]
+
+
+def plant(book, desc, cents, category_id, use):
+    """One transaction, straight in. The importer is 3a's business, not this PR's."""
+    book.execute(
+        """INSERT INTO transactions(account_id, txn_date, description, merchant_norm,
+                                    amount_cents, use, category_id, category_source,
+                                    dedup_key, created_at)
+           VALUES (1,'2026-02-02',?,?,?,?,?,'user',?,'2026-02-02')""",
+        (desc, desc, cents, use, category_id, desc))
+
+
+def ledger_spend(book):
+    """Every dollar of spending in the book, counted once, straight from SQL."""
+    row = book.execute(
+        "SELECT COALESCE(-SUM(amount_cents), 0) s FROM transactions WHERE amount_cents < 0"
+    ).fetchone()
+    return row["s"]
+
+
+# 31B (first, on the real shared ledger). The grand total is the whole ledger's
+# spend, counted once — asserted here on the messy book sections 1-30 built,
+# nesting and all, before the tidy fixtures below.
+shared = spend_rows()
+shared or fail("the shared ledger should have a spending table by now")
+shared[-1][0] == "All spending" or fail("the last row should be the grand total")
+shared[-1][4] == ledger_spend(conn) or fail(
+    f"grand total {shared[-1][4]} != the ledger's own SUM {ledger_spend(conn)}")
+sum(b + p for _, d, b, p, _ in shared[:-1] if d == 0) == shared[-1][4] or fail(
+    "the top-level rows must reconcile with the grand total")
+
+# 31A. THE MARQUEE TEST — a parent is the sum of its descendants, and the grand
+# total counts each dollar ONCE.
+roll = open_book("_test_rollup.sqlite")
+P = make_cat(roll, "Nut")
+L1 = make_cat(roll, "Nut Rent", P)
+L2 = make_cat(roll, "Nut Power", P)
+SP = make_cat(roll, "Nut Fix", P)
+L3 = make_cat(roll, "Nut Pipes", SP)
+SOLO = make_cat(roll, "Nut Solo")
+EMPTY = make_cat(roll, "Nut Empty")
+make_cat(roll, "Nut Empty Leaf", EMPTY)
+
+plant(roll, "RENT", -30000, L1, "business")
+plant(roll, "POWER B", -5000, L2, "business")
+plant(roll, "POWER P", -2000, L2, "personal")
+plant(roll, "PIPES B", -100, L3, "business")
+plant(roll, "PIPES P", -900, L3, "personal")
+plant(roll, "SOLO", -1000, SOLO, "business")
+plant(roll, "INVOICE", 50000, SOLO, "business")     # money IN is not spending
+roll.commit()
+
+table = {row[0]: row for row in spend_rows()}
+table["Nut Rent"][2:] == (30000, 0, 30000) or fail(f"leaf L1 wrong: {table['Nut Rent']}")
+table["Nut Power"][2:] == (5000, 2000, 7000) or fail(f"leaf L2 wrong: {table['Nut Power']}")
+table["Nut Pipes"][2:] == (100, 900, 1000) or fail(f"leaf L3 wrong: {table['Nut Pipes']}")
+# the sub-parent is exactly its one leaf...
+table["Nut Fix"][2:] == (100, 900, 1000) or fail(f"SP should equal L3: {table['Nut Fix']}")
+# ...and the parent is exactly L1 + L2 + L3, per column
+table["Nut"][2:] == (35100, 2900, 38000) or fail(
+    f"P should be L1+L2+L3 in every column: {table['Nut']}")
+# the business column rolls up on its own, not as a share of the total
+table["Nut"][2] == sum(table[n][2] for n in ("Nut Rent", "Nut Power", "Nut Pipes")) or fail(
+    "a parent's business column must be the sum of its descendants' business")
+table["Nut"][3] == sum(table[n][3] for n in ("Nut Rent", "Nut Power", "Nut Pipes")) or fail(
+    "a parent's personal column must be the sum of its descendants' personal")
+
+# the depths the page renders
+depths = {r[0]: r[1] for r in spend_rows()}
+depths["Nut"] == 0 or fail("the parent sits at depth 0")
+depths["Nut Fix"] == 1 or fail("the sub-parent sits at depth 1")
+depths["Nut Pipes"] == 2 or fail("its leaf sits at depth 2")
+# ...and children are printed beneath their parent, biggest first
+names = [r[0] for r in spend_rows()]
+names.index("Nut Rent") == names.index("Nut") + 1 or fail(
+    "the biggest child should follow its parent immediately")
+names.index("Nut Power") < names.index("Nut Fix") or fail(
+    "siblings should be ordered by total spend, descending")
+names.index("Nut Pipes") == names.index("Nut Fix") + 1 or fail(
+    "a leaf should follow its own sub-parent")
+
+# THE POINT: each dollar once. Not P + SP + every leaf, which triple-counts.
+grand = spend_rows()[-1]
+grand[0] == "All spending" or fail("the grand total row should be last")
+grand[2:] == (36100, 2900, 39000) or fail(f"the grand total is wrong: {grand}")
+grand[4] == ledger_spend(roll) or fail("the grand total must equal the ledger's own SUM")
+printed = sum(r[4] for r in spend_rows()[:-1])
+printed == 78000 or fail(f"the fixture no longer demonstrates the trap: {printed}")
+grand[4] != printed or fail(
+    "the grand total is the sum of every printed row — parents are double-counted")
+grand[4] == sum(r[4] for r in spend_rows()[:-1] if r[1] == 0) or fail(
+    "the grand total must reconcile with the top-level rows")
+
+# 31C. an empty heading is not printed — neither it nor its childless leaf
+"Nut Empty" in names and fail("a heading with no spend beneath it must not render")
+"Nut Empty Leaf" in names and fail("a leaf with no spend must not render")
+# money IN never reaches this table
+sum(r[4] for r in spend_rows()[:-1] if r[1] == 0) == 39000 or fail(
+    "a positive amount is income, not spending — it must not be counted")
+
+# 31D. FLAT COMPATIBILITY — with nothing nested, the category rows are exactly
+# what the pre-rollup dashboard produced, computed here the old way.
+flat = open_book("_test_flat.sqlite")
+seed = {r["name"]: r["id"] for r in flat.execute("SELECT id, name FROM categories")}
+for desc, cents, cat, use in (("F GROC", -4200, "Groceries", "personal"),
+                              ("F GEAR", -99900, "Equipment", "business"),
+                              ("F GAS", -6000, "Gas / Vehicle", "business"),
+                              ("F GAS2", -1500, "Gas / Vehicle", "personal"),
+                              ("F LUNCH", -1800, "Meals", "business")):
+    plant(flat, desc, cents, seed[cat], use)
+plant(flat, "F NOCAT", -700, None, "personal")       # no category at all
+flat.commit()
+
+# the renderer this PR replaced, reproduced verbatim
+spend = {}
+for r in flat.execute(
+        """SELECT c.name cat, t.use, a.default_use, t.amount_cents
+             FROM transactions t
+             JOIN accounts a ON a.id=t.account_id
+             LEFT JOIN categories c ON c.id=t.category_id
+            WHERE t.amount_cents < 0"""):
+    cat = r["cat"] or "Uncategorized"
+    d = spend.setdefault(cat, {"business": 0, "personal": 0})
+    d[A.txn_use(r)] = d.get(A.txn_use(r), 0) + (-r["amount_cents"])
+was = [(c, 0, v["business"], v["personal"], v["business"] + v["personal"])
+       for c, v in sorted(spend.items(),
+                          key=lambda kv: -(kv[1]["business"] + kv[1]["personal"]))]
+spend_rows()[:-1] == was or fail(
+    f"a flat book must render exactly as before:\n  now {spend_rows()[:-1]}\n  was {was}")
+flat_html = client.get("/").data.decode()
+"padding-left" not in flat_html[flat_html.index("Spending by category"):] or fail(
+    "a flat book must have no indentation at all")
+# ...including the row an uncategorized transaction lands on: one row, not two
+len([r for r in spend_rows() if r[0] == "Uncategorized"]) == 1 or fail(
+    "a NULL category and Uncategorized are one row, as they always were")
+spend_rows()[-1][4] == ledger_spend(flat) or fail(
+    "a flat book's grand total is still the whole ledger, counted once")
+
+# 31E. the business/personal split survives the rollup on a real mixed tree
+A.DB_PATH = "_test_rollup.sqlite"
+mixed = {row[0]: row for row in spend_rows()}
+mixed["Nut"][2] + mixed["Nut"][3] == mixed["Nut"][4] or fail(
+    "business + personal must equal the total on a rolled-up row")
+mixed["Nut Power"][2] == 5000 and mixed["Nut Power"][3] == 2000 or fail(
+    "a leaf's own split must be untouched by the rollup")
+
+# 31F. the category sort now orders by PATH, so a leaf sorts under its parent.
+# Two leaves whose bare names order one way and whose paths order the other.
+book = A.get_conn()
+ALPHA = make_cat(book, "Alpha")
+BETA = make_cat(book, "Beta")
+AZ = make_cat(book, "Zulu Leaf", ALPHA)          # path: Alpha > Zulu Leaf
+BA = make_cat(book, "Apple Leaf", BETA)          # path: Beta > Apple Leaf
+plant(book, "SORT ZULU", -111, AZ, "business")
+plant(book, "SORT APPLE", -222, BA, "business")
+plant(book, "SORT NOCAT", -333, None, "business")
+plant(book, "SORT UNC", -444, book.execute(
+    "SELECT id FROM categories WHERE name='Uncategorized'").fetchone()["id"], "business")
+book.commit()
+
+
+def sorted_descriptions(query):
+    return [d for _, d in rendered_rows(query)]
+
+
+by_path = sorted_descriptions("?sort=cat&dir=asc")
+by_path.index("SORT ZULU") < by_path.index("SORT APPLE") or fail(
+    "Alpha › Zulu Leaf must sort before Beta › Apple Leaf — the PATH decides, "
+    "not the leaf's own name")
+# every one of a heading's rows is contiguous: its path is their prefix
+nut = [i for i, d in enumerate(by_path) if d in ("RENT", "POWER B", "POWER P",
+                                                 "PIPES B", "PIPES P")]
+nut == list(range(min(nut), min(nut) + len(nut))) or fail(
+    "a heading's transactions should sort together, under its path")
+# ...and the sub-parent's leaf sits inside that run, in path order
+by_path.index("PIPES B") < by_path.index("POWER B") or fail(
+    "Nut › Nut Fix › Nut Pipes sorts before Nut › Nut Power")
+# a NULL category sorts as Uncategorized, alongside the real thing
+unc = sorted((by_path.index("SORT NOCAT"), by_path.index("SORT UNC")))
+unc[1] == unc[0] + 1 or fail("an uncategorized row must sort with Uncategorized")
+# descending flips the paths (the id tiebreaker does not flip, exactly as it
+# never has for any other sort, so rows sharing a path keep their order)
+down = sorted_descriptions("?sort=cat&dir=desc")
+down.index("SORT APPLE") < down.index("SORT ZULU") or fail(
+    "cat desc should reverse the path order")
+down.index("POWER B") < down.index("PIPES B") or fail(
+    "cat desc should reverse the path order within a heading too")
+
+# the whitelist still decides, and a bogus key still falls back to date/DESC
+A.parse_sort({"sort": "cat", "dir": "asc"}) == ("cat", "ASC") or fail("cat/asc should parse")
+for bogus in ({"sort": "bogus", "dir": "bogus"}, {"sort": "cat", "dir": "sideways"},
+              {"sort": "c.name; DROP TABLE transactions--", "dir": "asc"}, {}):
+    A.parse_sort(bogus) == A.SORT_DEFAULT or fail(f"{bogus} should fall back to the default")
+sorted_descriptions("?sort=bogus&dir=bogus") == sorted_descriptions("?sort=date&dir=desc") \
+    or fail("a bogus sort must render exactly the default order")
+A.SORT_COLUMNS["cat"] == "COALESCE(cp.path,'Uncategorized')" or fail(
+    "the cat sort key should be the path expression, from the whitelist")
+r = client.get("/transactions?sort=cat%27%3B+DROP+TABLE+transactions--&dir=asc%27--")
+r.status_code == 200 or fail("a hostile sort should be ignored, not error")
+book.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"] > 0 or fail(
+    "the transactions table should still be there")
+# the separator reaches SQL as a bound parameter, never as interpolated text
+"CAT_PATHS" in src and "db.CATEGORY_SEP" in src or fail(
+    "the path CTE should bind db.CATEGORY_SEP")
+src[src.index("CAT_PATHS = "):src.index("CAT_PATHS = ") + 400].count("›") == 0 or fail(
+    "the separator must be bound, not written into the SQL")
+
+# 31G. no schema change, and no new dependency
+{r["name"]: {c[1] for c in book.execute(f"PRAGMA table_info({r['name']})")}
+ for r in book.execute("SELECT name FROM sqlite_master WHERE type='table'")} == SCHEMA \
+    or fail("the rollup is a rendering change — the schema must be untouched")
+dbsrc = io.open("db.py", encoding="utf-8").read()
+"rollup" not in dbsrc.lower() or fail("db.py knows nothing about the dashboard")
+rollup_src = src[src.index("def spending_rollup("):]
+rollup_src = rollup_src[:rollup_src.index("\n@app.route")]
+for banned in ("CREATE TABLE", "ALTER TABLE", "INSERT", "UPDATE ", "DELETE"):
+    banned not in rollup_src or fail(f"spending_rollup must only read ({banned})")
+# the docstring names floats on purpose; what matters is the code under it
+rollup_code = rollup_src.split('"""')[2]
+for banned in ("float(", "/ 100", "/100", "round("):
+    banned not in rollup_code or fail(
+        f"money stays integer cents in the rollup — invariant 1 ({banned})")
+imports = set()
+for node in ast.walk(ast.parse(src)):
+    if isinstance(node, ast.Import):
+        imports |= {a.name.split(".")[0] for a in node.names}
+    elif isinstance(node, ast.ImportFrom) and node.module:
+        imports.add(node.module.split(".")[0])
+imports == {"csv", "html", "io", "json", "os", "secrets", "sqlite3", "subprocess",
+            "sys", "datetime", "decimal", "flask", "db", "categorizer"} or fail(
+    f"app.py's imports changed: {sorted(imports)}")
+
+# 31H. and no JavaScript came along with any of it
+dash = client.get("/").data.decode()
+dash.count("<script") == 1 or fail("the dashboard should still carry one script block")
+for banned in ("onclick", "onchange", "addEventListener", "fetch("):
+    banned not in dash[dash.index("<h1>Dashboard</h1>"):dash.index("<script")] or fail(
+        f"the dashboard must contain no {banned!r}")
+
+A.DB_PATH = REAL_DB
+for leftover in ("_test_rollup.sqlite", "_test_flat.sqlite"):
+    os.path.exists(leftover) and os.remove(leftover)
+
+
 os.remove("_test.sqlite")
 for leftover in (PROFILES, PROFILES + ".tmp"):
     if os.path.exists(leftover):

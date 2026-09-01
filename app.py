@@ -611,6 +611,7 @@ BASE = """
     border:1px solid var(--line);border-radius:12px;overflow:hidden}
   th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px}
   th{color:var(--muted);font-weight:600;background:#faf9f5} tr:last-child td{border-bottom:0}
+  tr.sum td{border-top:2px solid var(--line);font-weight:600;background:#faf9f5}
   td.r,th.r{text-align:right}
   th a{color:inherit;text-decoration:none} th a:hover{text-decoration:underline}
   .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
@@ -1284,6 +1285,98 @@ def batch_detail(conn, batch_id):
 
 # ----------------------------- routes ------------------------------------
 
+def spending_rollup(conn):
+    """Spending by category, rolled up the tree. Returns (nodes, grand).
+
+    Every transaction sits on a LEAF — nothing is ever assigned to a heading —
+    so spend is MEASURED on the leaves and a heading's figure is exactly the
+    sum of what sits beneath it. Two consequences worth stating out loud:
+
+      * A heading has no spend of its own to add. Its row and its children's
+        rows are the same money at two zoom levels, not more money.
+      * Which is why the grand total is computed from the LEAF buckets and
+        never from the rows this returns. Adding up every printed row would
+        count a nested dollar once per ancestor.
+
+    A node with no spend anywhere beneath it is left out entirely, so an empty
+    heading never prints and a flat book renders exactly the rows it always
+    did. Amounts are positive integer cents (money out), bucketed by `use`
+    exactly as the dashboard has always bucketed them — invariant 1 holds:
+    nothing here is ever a float.
+    """
+    rows = conn.execute(
+        """SELECT t.category_id, t.use, a.default_use, t.amount_cents
+             FROM transactions t
+             JOIN accounts a ON a.id=t.account_id
+            WHERE t.amount_cents < 0""").fetchall()
+
+    # A row with no category at all reads as Uncategorized, which is how this
+    # table has always shown it. Uncategorized is seeded and cannot be deleted
+    # (it is the fallback the whole app resolves to), so this lookup finds it.
+    seeded = conn.execute("SELECT id FROM categories WHERE name=?",
+                          (db.SYSTEM_LEAF,)).fetchone()
+    homeless = seeded["id"] if seeded else None
+
+    leaf = {}                      # category id -> {use: cents}
+    for r in rows:
+        cid = r["category_id"] if r["category_id"] is not None else homeless
+        bucket = leaf.setdefault(cid, {})
+        use = txn_use(r)
+        bucket[use] = bucket.get(use, 0) + (-r["amount_cents"])
+
+    # The grand total counts each dollar ONCE: it reads the leaf buckets, which
+    # are the only place money actually sits, and never the rolled-up rows.
+    grand = {"business": 0, "personal": 0}
+    for bucket in leaf.values():
+        for use in grand:
+            grand[use] += bucket.get(use, 0)
+
+    cats = conn.execute("SELECT id, name, parent_id FROM categories").fetchall()
+    kids = {}
+    for c in cats:
+        kids.setdefault(c["parent_id"], []).append(c)
+
+    rolled = {}                    # category id -> {use: cents}, self + descendants
+
+    def gather(cid):
+        total = dict(leaf.get(cid, {}))
+        for kid in kids.get(cid, []):
+            for use, cents in gather(kid["id"]).items():
+                total[use] = total.get(use, 0) + cents
+        rolled[cid] = total
+        return total
+
+    for top in kids.get(None, []):
+        gather(top["id"])
+
+    def ranked(cents):
+        # The order this table has always used: biggest spender first. Applied
+        # within each parent, so a heading's children rank among themselves.
+        return -(cents.get("business", 0) + cents.get("personal", 0))
+
+    nodes = []
+
+    def walk(parent_id, depth):
+        for kid in sorted((k for k in kids.get(parent_id, []) if rolled.get(k["id"])),
+                          key=lambda k: ranked(rolled[k["id"]])):
+            cents = rolled[kid["id"]]
+            nodes.append({"id": kid["id"], "name": kid["name"], "depth": depth,
+                          "business": cents.get("business", 0),
+                          "personal": cents.get("personal", 0)})
+            walk(kid["id"], depth + 1)
+
+    walk(None, 0)
+
+    # Belt and braces: spend that landed on no category and found no
+    # Uncategorized row to adopt it still gets a line, rather than quietly
+    # leaving the table while staying in the grand total.
+    if homeless is None and None in leaf:
+        nodes.append({"id": None, "name": db.SYSTEM_LEAF, "depth": 0,
+                      "business": leaf[None].get("business", 0),
+                      "personal": leaf[None].get("personal", 0)})
+    return nodes, grand
+
+
 @app.route("/")
 def dashboard():
     conn = get_conn()
@@ -1294,20 +1387,7 @@ def dashboard():
            WHERE c.name IS NULL OR c.name='Uncategorized'"""
     ).fetchone()["n"]
 
-    rows = conn.execute(
-        """SELECT c.name cat, t.use, a.default_use, t.amount_cents
-             FROM transactions t
-             JOIN accounts a ON a.id=t.account_id
-             LEFT JOIN categories c ON c.id=t.category_id
-            WHERE t.amount_cents < 0"""
-    ).fetchall()
-    spend = {}
-    for r in rows:
-        cat = r["cat"] or "Uncategorized"
-        use = txn_use(r)
-        d = spend.setdefault(cat, {"business": 0, "personal": 0})
-        d[use] = d.get(use, 0) + (-r["amount_cents"])
-    ranked = sorted(spend.items(), key=lambda kv: -(kv[1]["business"] + kv[1]["personal"]))
+    nodes, grand = spending_rollup(conn)
 
     ai = "on" if ollama_available() else "off"
     cards = f"""
@@ -1317,13 +1397,29 @@ def dashboard():
         <div class=card><div class=k>Uncategorized</div><div class="v num">{uncat}</div></div>
       </div>"""
 
-    if ranked:
+    if nodes:
+        def cat_cell(n):
+            # Indentation carries the nesting, so the label stays the node's own
+            # name. A top-level row is written exactly as it always was, which
+            # is what keeps a flat book's table byte-identical to before.
+            label = esc(n["name"])
+            return (f"<span style='padding-left:{n['depth'] * 18}px'>{label}</span>"
+                    if n["depth"] else label)
+
+        def money_row(cells, cls=""):
+            b, p = cells["business"], cells["personal"]
+            return (f"<tr{cls}><td>{cells['label']}</td>"
+                    f"<td class='r num'>{money(-b)}</td>"
+                    f"<td class='r num'>{money(-p)}</td>"
+                    f"<td class='r num'>{money(-(b + p))}</td></tr>")
+
         rowshtml = "".join(
-            f"<tr><td>{esc(c)}</td><td class='r num'>{money(-v['business'])}</td>"
-            f"<td class='r num'>{money(-v['personal'])}</td>"
-            f"<td class='r num'>{money(-(v['business']+v['personal']))}</td></tr>"
-            for c, v in ranked
-        )
+            money_row({"label": cat_cell(n), "business": n["business"],
+                       "personal": n["personal"]})
+            for n in nodes)
+        # Each dollar once: this is the leaf total, not the sum of the rows
+        # above it, which would count a nested dollar once per ancestor.
+        rowshtml += money_row({"label": "All spending", **grand}, cls=" class=sum")
         spendtbl = f"""<h2>Spending by category</h2>
           <table><tr><th>Category</th><th class=r>Business</th>
           <th class=r>Personal</th><th class=r>Total</th></tr>{rowshtml}</table>"""
@@ -2316,14 +2412,30 @@ def categorize():
 
 # Sorting is server-side and whitelisted: the query string picks a key, never
 # a fragment of SQL. Anything unrecognized falls back to SORT_DEFAULT.
+#
+# `cat` sorts on the full PATH, not the leaf's own name, so a nested leaf sorts
+# beneath its parent instead of away under its own initial. The path is built
+# by CAT_PATHS below; a parent's path is a prefix of its children's, so plain
+# text order already puts a heading's rows together and in tree order.
 SORT_COLUMNS = {
     "date": "t.txn_date",
     "desc": "t.description",
-    "cat": "COALESCE(c.name,'Uncategorized')",
+    "cat": "COALESCE(cp.path,'Uncategorized')",
     "amount": "t.amount_cents",
 }
 SORT_DIRS = {"asc": "ASC", "desc": "DESC"}
 SORT_DEFAULT = ("date", "DESC")
+
+# Each category's full path as one string, walked down from the top level.
+# Written once here because it is fixed SQL, not user input: the only value
+# that reaches it is db.CATEGORY_SEP, bound as a parameter by the caller.
+CAT_PATHS = """
+    WITH RECURSIVE cat_path(id, path) AS (
+        SELECT id, name FROM categories WHERE parent_id IS NULL
+        UNION ALL
+        SELECT c.id, p.path || ? || c.name
+          FROM categories c JOIN cat_path p ON c.parent_id = p.id
+    )"""
 
 
 def parse_sort(args):
@@ -2383,12 +2495,16 @@ def transactions():
     sort, direction = parse_sort(request.args)
     # Both halves come from the whitelists above; t.id keeps the order stable.
     order = f"ORDER BY {SORT_COLUMNS[sort]} {direction}, t.id DESC"
+    # The separator is bound, not interpolated: db.CATEGORY_SEP stays the one
+    # place the path is spelled, in SQL as well as in Python.
     rows = conn.execute(
-        f"""SELECT t.*, a.name acct, a.default_use, c.name catname
+        f"""{CAT_PATHS}
+            SELECT t.*, a.name acct, a.default_use, c.name catname
              FROM transactions t
              JOIN accounts a ON a.id=t.account_id
              LEFT JOIN categories c ON c.id=t.category_id
-            {order}"""
+             LEFT JOIN cat_path cp ON cp.id=t.category_id
+            {order}""", (db.CATEGORY_SEP,)
     ).fetchall()
     if not rows:
         return page("<h1>Transactions</h1><div class=empty>No transactions yet.</div>", "txns")
