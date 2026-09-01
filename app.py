@@ -42,6 +42,8 @@ import json
 import os
 import secrets
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -189,6 +191,83 @@ def detect_columns(header):
             "amount": amount, "debit": None, "credit": None}
 
 
+# -------------------- native macOS integration (mac-only) ------------------
+# Same shape the footage pipeline uses for its native folder picker: check
+# sys.platform, shell out to osascript with an argv LIST, treat a user cancel
+# as a normal answer rather than an error. Everything mac-only funnels through
+# run_command — the one place this app starts a process — so there is a single
+# seam to check the platform at, and a single seam a test replaces to exercise
+# all of this without a dialog or a Finder window ever opening.
+#
+# None of it is load-bearing: with no picker at all the browser upload beside
+# it does the whole job, which is what happens on any non-mac OS.
+MAX_IMPORT_BYTES = 32 * 1024 * 1024      # a statement this big is not a statement
+PICKER_TIMEOUT = 300                     # a modal dialog: the user may take a while
+REVEAL_TIMEOUT = 15
+
+# No interpolation, ever: the script is a constant, so nothing a user types can
+# reach AppleScript. The path comes back OUT of it, it never goes in.
+CHOOSE_FILE_SCRIPT = 'POSIX path of (choose file with prompt "Choose a CSV file")'
+
+
+def is_mac():
+    """True on macOS. A function, not a constant, so tests can drive both paths."""
+    return sys.platform == "darwin"
+
+
+def run_command(argv, timeout=REVEAL_TIMEOUT):
+    """Run `argv` and hand back the CompletedProcess. The only spawn in the app.
+
+    argv is always a list and `shell=` is never passed, so a path with spaces,
+    quotes or a semicolon in it stays one argument instead of something a shell
+    gets to parse.
+    """
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+class NotOnMac(Exception):
+    """Raised by the mac-only helpers so routes answer 501 in exactly one way."""
+
+
+def native_choose_file():
+    """The macOS file dialog -> an absolute POSIX path, or None if cancelled.
+
+    A browser <input type=file> hands over bytes and a bare filename; it never
+    says where the file lives. That is the whole reason this exists — with the
+    real path we can reveal the file in Finder later.
+    """
+    if not is_mac():
+        raise NotOnMac()
+    try:
+        done = run_command(["osascript", "-e", CHOOSE_FILE_SCRIPT], timeout=PICKER_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        # Cancel is returncode 1 with "User canceled. (-128)" on stderr. A
+        # dialog that genuinely failed gets the same answer: no file chosen.
+        return None
+    path = (done.stdout or "").strip()
+    return path or None
+
+
+def reveal_in_finder(path):
+    """`open -R <path>` — select the file in Finder. True if Finder took it."""
+    if not is_mac():
+        raise NotOnMac()
+    try:
+        return run_command(["open", "-R", path]).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def not_on_mac(note):
+    """501, with the page still rendered — the browser upload is right there."""
+    body = f"""<h1>Not available here</h1>
+      <p class=sub>{esc(note)}</p>
+      <a class=btn href="{url_for('do_import')}">Back to import</a>"""
+    return page(body, "import"), 501
+
+
 # Phase-1 uploads waiting for the user to confirm their column mapping, keyed by
 # a random token. Deliberately in memory and nowhere near the schema: a parked
 # upload is not ledger data, and a half-finished import should not survive a
@@ -203,14 +282,22 @@ PREVIEW_ROWS = 5
 SIGN_CHOICES = (("negative", "Negative numbers"), ("positive", "Positive numbers"))
 
 
-def stash_import(account_id, filename, header, data, preamble, detected):
-    """Park a parsed upload for phase 2 and return its token."""
+def stash_import(account_id, filename, header, data, preamble, detected,
+                 source_path=None):
+    """Park a parsed upload for phase 2 and return its token.
+
+    `source_path` is the absolute path of a natively-picked file (None for a
+    browser upload). It rides in the stash and nowhere else — never in a URL,
+    never in a hidden field — so the only path phase 2 can commit is one this
+    process read off a dialog, not one a request handed it.
+    """
     while len(PENDING_IMPORTS) >= MAX_PENDING:
         PENDING_IMPORTS.pop(next(iter(PENDING_IMPORTS)))     # oldest first
     token = secrets.token_urlsafe(16)
     PENDING_IMPORTS[token] = {
         "account_id": account_id, "filename": filename, "header": header,
         "data": data, "preamble": preamble, "detected": detected,
+        "source_path": source_path,
     }
     return token
 
@@ -555,6 +642,8 @@ BASE = """
     display:flex;flex-direction:column;gap:14px;max-width:520px}
   .status{font-size:13px;padding:6px 10px;border-radius:8px}
   .status.on{background:#e7f2ec;color:var(--settled)} .status.off{background:#f0eee8;color:var(--muted)}
+  /* buttons that sit side by side in a table cell or under a form */
+  .rowbtns{display:flex;gap:6px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
   /* --- import mapping: the saved-profiles bar (plain forms, no script) --- */
   .profiles{display:flex;flex-wrap:wrap;gap:8px;align-items:center;
     padding:0 0 12px;margin:0 0 4px;border-bottom:1px solid var(--line)}
@@ -1166,7 +1255,7 @@ def recent_imports(conn, limit=25):
     still attached to the batch.
     """
     return conn.execute(
-        """SELECT b.id, b.filename, b.imported_at, a.name AS acct,
+        """SELECT b.id, b.filename, b.imported_at, b.source_path, a.name AS acct,
                   (SELECT COUNT(*) FROM transactions t
                     WHERE t.import_batch_id = b.id) AS live_count
              FROM import_batches b
@@ -1178,7 +1267,7 @@ def recent_imports(conn, limit=25):
 def batch_detail(conn, batch_id):
     """One batch with its live transaction count, or None if it's gone."""
     return conn.execute(
-        """SELECT b.id, b.filename, b.imported_at, a.name AS acct,
+        """SELECT b.id, b.filename, b.imported_at, b.source_path, a.name AS acct,
                   (SELECT COUNT(*) FROM transactions t
                     WHERE t.import_batch_id = b.id) AS live_count
              FROM import_batches b
@@ -1248,40 +1337,49 @@ def dashboard():
     return page(body, "dash")
 
 
+def phase_one(account_id, filename, text, source_path=None):
+    """Parse a CSV and render the mapping page. Writes nothing, ever.
+
+    Both ways of choosing a file — the browser upload and the native picker —
+    land here, so a natively-picked file gets exactly the same parse, header
+    detection, auto-detected mapping and stash as an uploaded one. The single
+    difference is `source_path`, which goes into the stash and nowhere else.
+    """
+    reader = csv.reader(io.StringIO(text))
+    rows = [r for r in reader if any(c.strip() for c in r)]
+    if not rows:
+        return page("<div class=empty>That file looked empty.</div>", "import")
+
+    # Preamble lines above the real header ("Date Range : ...") are discarded,
+    # not counted as unreadable rows.
+    h = find_header_row(rows)
+    header, data = rows[h], rows[h + 1:]
+    cols = detect_columns(header)
+    if not mapping_is_complete(cols):
+        return page(
+            "<div class=empty>Couldn't find date / description / amount columns "
+            "in that file's header, so there's nothing to map yet. "
+            "Check the file and try again.</div>", "import")
+
+    cols["sign"] = "negative"      # a signed amount column, read as written
+    token = stash_import(account_id, filename, header, data, h, cols, source_path)
+    return page(mapping_body(token, PENDING_IMPORTS[token], cols), "import")
+
+
 @app.route("/import", methods=["GET", "POST"])
 def do_import():
     conn = get_conn()
     accounts = conn.execute("SELECT * FROM accounts ORDER BY name").fetchall()
 
     if request.method == "POST":
-        # ---- phase 1: parse and auto-detect a starting mapping. Nothing is
-        # written here — no import_batches row, no transactions. The parsed file
-        # is parked in memory and the user gets a mapping + preview screen.
         account_id = int(request.form["account_id"])
         f = request.files.get("file")
         if not f or not f.filename:
             return page("<div class=empty>No file chosen.</div>", "import")
-
+        # A browser upload knows the bytes and the bare filename, never the
+        # path — so no source_path, and this batch gets no Reveal button.
         text = f.read().decode("utf-8-sig", errors="replace")
-        reader = csv.reader(io.StringIO(text))
-        rows = [r for r in reader if any(c.strip() for c in r)]
-        if not rows:
-            return page("<div class=empty>That file looked empty.</div>", "import")
-
-        # Preamble lines above the real header ("Date Range : ...") are discarded,
-        # not counted as unreadable rows.
-        h = find_header_row(rows)
-        header, data = rows[h], rows[h + 1:]
-        cols = detect_columns(header)
-        if not mapping_is_complete(cols):
-            return page(
-                "<div class=empty>Couldn't find date / description / amount columns "
-                "in that file's header, so there's nothing to map yet. "
-                "Check the file and try again.</div>", "import")
-
-        cols["sign"] = "negative"      # a signed amount column, read as written
-        token = stash_import(account_id, f.filename, header, data, h, cols)
-        return page(mapping_body(token, PENDING_IMPORTS[token], cols), "import")
+        return phase_one(account_id, f.filename, text)
 
     opts = "".join(
         f"<option value=\"{a['id']}\">{esc(a['name'])} — {esc(a['default_use'])}</option>"
@@ -1292,15 +1390,23 @@ def do_import():
     msg = request.args.get("msg", "")
     note = f"<p class=sub><span class='status off'>{esc(msg)}</span></p>" if msg else ""
 
+    # The picker is an extra button on the very same form, so it carries the
+    # account you picked. Off-mac it simply isn't there and the upload — which
+    # is the primary path either way — is the whole story.
+    picker = ("<button class='btn ghost' formaction=\"%s\" formenctype=\"multipart/form-data\">"
+              "Choose file on this Mac…</button>" % url_for("choose_import_file")
+              if is_mac() else "")
+
     batches = recent_imports(conn)
     if batches:
         rows_html = "".join(
             f"<tr><td>{esc(b['filename'])}</td><td>{esc(b['acct'] or '—')}</td>"
             f"<td>{esc(str(b['imported_at'])[:10])}</td>"
             f"<td class='r num'>{b['live_count']}</td>"
-            f"<td class=r><form method=post action=\"{url_for('undo_import')}\">"
+            f"<td class=r><div class=rowbtns>{reveal_button(b)}"
+            f"<form method=post action=\"{url_for('undo_import')}\">"
             f"<input type=hidden name=batch_id value=\"{b['id']}\">"
-            f"<button class='btn ghost'>Undo import</button></form></td></tr>"
+            f"<button class='btn ghost'>Undo import</button></form></div></td></tr>"
             for b in batches)
         recent = f"""<h2>Recent imports</h2>
           <table><tr><th>File</th><th>Account</th><th>Imported</th>
@@ -1316,10 +1422,92 @@ def do_import():
       <form class=up method=post enctype=multipart/form-data>
         <div><label class=lbl>Account</label><br><select name=account_id>{opts}</select></div>
         <div><label class=lbl>CSV file</label><br><input type=file name=file accept=.csv></div>
-        <button class=btn>Import</button>
+        <div class=rowbtns style='justify-content:flex-start'>
+          <button class=btn>Import</button>
+          {picker}
+        </div>
       </form>
       {recent}"""
     return page(body, "import")
+
+
+def reveal_button(batch):
+    """The Reveal button for one import row — nothing at all without a path.
+
+    A browser-uploaded batch has source_path NULL and gets no button; off-mac
+    nobody gets one. The button carries the batch id and never a path: what
+    Finder is handed is looked up from that row's own source_path column.
+    """
+    if not batch["source_path"] or not is_mac():
+        return ""
+    return (f"<form method=post action=\"{url_for('reveal_import')}\">"
+            f"<input type=hidden name=batch_id value=\"{batch['id']}\">"
+            f"<button class='btn ghost'>Reveal in Finder</button></form>")
+
+
+@app.route("/import/choose", methods=["POST"])
+def choose_import_file():
+    """Phase 1 from the native macOS file dialog. Writes nothing.
+
+    Everything after the dialog is the ordinary import: the same parse, the same
+    mapping page, the same commit. The only thing gained by coming through here
+    is the file's real path, which a browser upload can never tell us.
+    """
+    try:
+        account_id = int(request.form.get("account_id", ""))
+    except (TypeError, ValueError):
+        return redirect(url_for("do_import"))
+
+    try:
+        path = native_choose_file()
+    except NotOnMac:
+        return not_on_mac("Choosing a file this way needs macOS. "
+                          "Use the file upload instead — it does the same import.")
+    if not path:
+        return redirect(url_for("do_import", msg="No file chosen."))
+
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(MAX_IMPORT_BYTES + 1)
+    except OSError:
+        return redirect(url_for("do_import", msg="Couldn't read that file."))
+    if len(raw) > MAX_IMPORT_BYTES:
+        return redirect(url_for("do_import", msg="That file is too large to import."))
+
+    return phase_one(account_id, os.path.basename(path),
+                     raw.decode("utf-8-sig", errors="replace"), path)
+
+
+@app.route("/import/reveal", methods=["POST"])
+def reveal_import():
+    """Show one import's original file in Finder.
+
+    The path comes from that batch's own source_path column and from nowhere
+    else — a path in the request body is ignored entirely — and it reaches
+    Finder as one argv element, never a shell string. Every sad path (no batch,
+    no path, file moved, not a mac) is a note on the import page, never a 500.
+    """
+    conn = get_conn()
+    try:
+        batch_id = int(request.form.get("batch_id", ""))
+    except (TypeError, ValueError):
+        return redirect(url_for("do_import"))
+
+    row = conn.execute("SELECT source_path FROM import_batches WHERE id=?",
+                       (batch_id,)).fetchone()
+    if row is None:
+        return redirect(url_for("do_import", msg="That import was already removed."))
+    if not is_mac():
+        return not_on_mac("Reveal is macOS-only.")
+    path = row["source_path"]
+    if not path:
+        return redirect(url_for("do_import", msg="No stored file for this import."))
+    if not os.path.exists(path):
+        return redirect(url_for("do_import", msg="That file has moved or been deleted."))
+
+    ok = reveal_in_finder(path)
+    return redirect(url_for("do_import", msg="Revealed in Finder." if ok
+                            else "Finder wouldn't open that file."))
 
 
 def column_select(name, headers, chosen):
@@ -1674,9 +1862,12 @@ def commit_import():
     cat_names = db.category_names(conn)
     cz = Categorizer(conn, cat_names)
     now = datetime.utcnow().isoformat()
+    # source_path is the stash's, which only the native picker ever sets: a
+    # browser-uploaded batch stores NULL, because no path was ever known.
     cur = conn.execute(
-        "INSERT INTO import_batches(account_id, filename, imported_at) VALUES (?,?,?)",
-        (account_id, stash["filename"], now))
+        """INSERT INTO import_batches(account_id, filename, imported_at, source_path)
+           VALUES (?,?,?,?)""",
+        (account_id, stash["filename"], now, stash.get("source_path")))
     batch_id = cur.lastrowid
     cat_id = db.category_map(conn)
 
@@ -1752,7 +1943,20 @@ def undo_import():
         # Already undone — a stale button in another tab, not an error.
         return redirect(url_for("do_import", msg="That import was already removed."))
 
+    # Read once, from this batch's own row: the only path this route can ever
+    # act on. Nothing in the request body is consulted for it.
+    path = batch["source_path"]
+    has_file = bool(path) and os.path.exists(path)
+
     if request.form.get("confirm") != "1":
+        # Off by default, and only offered when there really is a file to
+        # delete. Unticked, the file on disk is not touched at all.
+        filebox = (f"""
+            <label class=meta style='display:flex;gap:8px;align-items:flex-start'>
+              <input type=checkbox name=delete_file value="1">
+              <span>Also delete the original CSV file from disk —
+                <code>{esc(path)}</code>. Off by default; the import is removed
+                from the ledger either way.</span></label>""" if has_file else "")
         body = f"""
           <h1>Undo this import?</h1>
           <p class=sub>The transactions that came in with this file will be deleted.
@@ -1766,12 +1970,14 @@ def undo_import():
             </div>
             <div class=meta>transactions will be removed</div>
           </div>
-          <form method=post action="{url_for('undo_import')}"
-                style='display:flex;gap:10px;align-items:center'>
+          <form method=post action="{url_for('undo_import')}">
             <input type=hidden name=batch_id value="{batch['id']}">
             <input type=hidden name=confirm value="1">
-            <button class=btn>Confirm delete</button>
-            <a class='btn ghost' href="{url_for('do_import')}">Cancel</a>
+            {filebox}
+            <div class=rowbtns style='justify-content:flex-start;margin-top:12px'>
+              <button class=btn>Confirm delete</button>
+              <a class='btn ghost' href="{url_for('do_import')}">Cancel</a>
+            </div>
           </form>"""
         return page(body, "import")
 
@@ -1783,8 +1989,19 @@ def undo_import():
     conn.commit()
 
     plural = "" if removed == 1 else "s"
-    return redirect(url_for(
-        "do_import", msg=f"Removed {removed} transaction{plural} from {batch['filename']}."))
+    note = f"Removed {removed} transaction{plural} from {batch['filename']}."
+
+    # Strictly after the ledger removal, which is already committed above and
+    # cannot be undone or blocked by anything that happens here. The file is
+    # touched only if the box was ticked, and only this batch's own path.
+    if request.form.get("delete_file") == "1" and path:
+        try:
+            os.remove(path)
+            note += " The original file was deleted."
+        except OSError:
+            note += " The original file could not be deleted."
+
+    return redirect(url_for("do_import", msg=note))
 
 
 @app.route("/review", methods=["GET", "POST"])

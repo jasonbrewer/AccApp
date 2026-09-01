@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 
 os.environ["LEDGER_DB"] = "_test.sqlite"
 if os.path.exists("_test.sqlite"):
@@ -1980,11 +1981,351 @@ for node in ast.walk(tree):
         imports |= {a.name.split(".")[0] for a in node.names}
     elif isinstance(node, ast.ImportFrom) and node.module:
         imports.add(node.module.split(".")[0])
-imports == {"csv", "html", "io", "json", "os", "secrets", "sqlite3", "datetime",
-            "decimal", "flask", "db", "categorizer"} or fail(
+# subprocess + sys arrived with the native picker; both are stdlib, so the
+# dependency list is still Flask alone.
+imports == {"csv", "html", "io", "json", "os", "secrets", "sqlite3", "subprocess",
+            "sys", "datetime", "decimal", "flask", "db", "categorizer"} or fail(
     f"app.py's imports changed: {sorted(imports)}")
 io.open("requirements.txt", encoding="utf-8").read().split() == ["flask>=3.0"] or fail(
     "requirements.txt should still name Flask alone")
+
+# ---------------------------------------------------------------------------
+# 29A-29P. Native macOS file picker, Reveal in Finder, and the opt-in file
+# delete on undo. All of it is mac-only and additive: the browser upload is
+# untouched and remains the fallback everywhere else.
+#
+# Nothing here opens a dialog or a Finder window. The app shells out in exactly
+# one place — run_command(argv) — and decides the platform in exactly one place
+# — is_mac(). Both are swapped for recorders below, which is also how the tests
+# drive the non-mac paths on a machine that is not a mac.
+# ---------------------------------------------------------------------------
+
+REAL_IS_MAC, REAL_RUN = A.is_mac, A.run_command
+SHELLED = []                    # every argv the app tried to run, in order
+
+
+class Proc:
+    """What subprocess.run hands back, minus the process."""
+
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def seam(mac=True, returncode=0, stdout=""):
+    """Point both seams at a recorder. Returns SHELLED, freshly emptied."""
+    del SHELLED[:]
+    A.is_mac = lambda: mac
+    A.run_command = lambda argv, timeout=None: (
+        SHELLED.append(list(argv)) or Proc(returncode, stdout))
+    return SHELLED
+
+
+def temp_csv(text, name="statement.csv"):
+    """A real file on disk, in its own directory, to stand in for a picked file."""
+    folder = tempfile.mkdtemp(prefix="_ll_")
+    path = os.path.join(folder, name)
+    with io.open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    TEMP_DIRS.append(folder)
+    return path
+
+
+TEMP_DIRS = []
+def picked_csv(tag):
+    """Two rows, tagged so each file in this section is its own import.
+
+    Same content twice would dedup (invariant 7 doing its job), and these tests
+    are about the path, not about dedup.
+    """
+    return ("Date,Description,Amount\n"
+            f"09/01/2026,FAKE NATIVE {tag} COFFEE,-4.50\n"
+            f"09/02/2026,FAKE NATIVE {tag} HARDWARE,-21.10\n")
+
+
+def native_import(path, account_id="1", commit=True):
+    """Drive phase 1 through the picker seam, then commit like any other import."""
+    seam(stdout=path + "\n")
+    r = client.post("/import/choose", data={"account_id": account_id})
+    if not commit:
+        return r
+    return commit_mapping(r, account_id)
+
+
+def batch_row(batch_id=None):
+    where = "WHERE id=?" if batch_id else ""
+    args = (batch_id,) if batch_id else ()
+    return conn.execute(
+        f"SELECT id, filename, source_path FROM import_batches {where} "
+        f"ORDER BY id DESC LIMIT 1", args).fetchone()
+
+
+def import_page(mac=True):
+    seam(mac=mac)
+    return client.get("/import")
+
+
+def txn_count():
+    return conn.execute("SELECT COUNT(*) n FROM transactions").fetchone()["n"]
+
+
+SEEN = []                       # every status code this section produced
+
+
+def status(r):
+    SEEN.append(r.status_code)
+    return r
+
+
+# 29A. the schema change: one nullable column on import_batches, nothing else
+SCHEMA = {
+    "accounts": {"id", "name", "kind", "default_use", "created_at"},
+    "allocations": {"id", "txn_id", "category_id", "use", "amount_cents"},
+    "attachments": {"id", "document_id", "txn_id", "confirmed_by_user"},
+    "categories": {"id", "name", "kind", "use_default", "active"},
+    "documents": {"id", "filename", "sha256", "stored_path", "imported_at"},
+    "import_batches": {"id", "account_id", "filename", "imported_at", "row_count",
+                       "dup_count", "source_path"},
+    "merchant_rules": {"id", "merchant_norm", "category_id", "use", "hits", "updated_at"},
+    "transactions": {"id", "account_id", "txn_date", "description", "merchant_norm",
+                     "amount_cents", "use", "category_id", "category_source",
+                     "ai_confidence", "reviewed", "reconciled", "note",
+                     "import_batch_id", "dedup_key", "created_at"},
+    "transfers": {"id", "txn_a_id", "txn_b_id", "confirmed"},
+}
+live = {r["name"]: {c[1] for c in conn.execute(f"PRAGMA table_info({r['name']})")}
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+live == SCHEMA or fail(f"the schema is not what this PR says it is: {live}")
+# ...and source_path is nullable with no default, so older batches are just NULL
+info = {r[1]: r for r in conn.execute("PRAGMA table_info(import_batches)")}
+info["source_path"][2].upper() == "TEXT" or fail("source_path should be TEXT")
+info["source_path"][3] == 0 or fail("source_path must be nullable")
+info["source_path"][4] is None or fail("source_path must have no default")
+# a fresh database gets the column from init_db, with no migration step
+FRESH = "_test_fresh.sqlite"
+os.path.exists(FRESH) and os.remove(FRESH)
+fresh = D.init_db(FRESH)
+{c[1] for c in fresh.execute("PRAGMA table_info(import_batches)")} == \
+    SCHEMA["import_batches"] or fail("init_db does not create source_path on a fresh file")
+fresh.close()
+os.remove(FRESH)
+
+# 29B. the browser upload is untouched: it still imports, stores NO path, and
+# gets no Reveal button even on a mac.
+before = txn_count()
+r = status(import_csv("Date,Description,Amount\n09/03/2026,FAKE UPLOAD DINER,-8.25\n",
+                      "uploaded.csv"))
+b"Imported 1 new" in r.data or fail("the browser upload must still import end to end")
+txn_count() == before + 1 or fail("the browser upload wrote no transaction")
+uploaded = batch_row()
+uploaded["source_path"] is None or fail(
+    f"a browser upload must store NULL source_path, got {uploaded['source_path']!r}")
+r = status(import_page(mac=True))
+b"Reveal in Finder" not in r.data or fail(
+    "a batch with no stored path must render no Reveal button, even on a mac")
+
+# 29C. the picker only exists on a mac; off-mac the upload form is the fallback
+r = status(import_page(mac=True))
+b"Choose file on this Mac" in r.data or fail("the picker button should render on a mac")
+r = status(import_page(mac=False))
+b"Choose file on this Mac" not in r.data or fail("the picker must not render off-mac")
+b'type=file name=file accept=.csv' in r.data or fail(
+    "the browser upload must still be there off-mac — it is the fallback")
+
+# 29D. a natively-picked file: same parse, same mapping page, same commit, plus
+# the absolute path carried through the stash (never a form field or a URL).
+picked = temp_csv(picked_csv("PICK"))
+seam(stdout=picked + "\n")
+r = status(client.post("/import/choose", data={"account_id": "1"}))
+b"Check the columns" in r.data or fail("the picker should land on the mapping page")
+SHELLED == [["osascript", "-e", A.CHOOSE_FILE_SCRIPT]] or fail(
+    f"the picker should run one osascript argv, ran {SHELLED}")
+# the AppleScript is a module constant: nothing is ever formatted into it
+choosesrc = src[src.index("def native_choose_file("):]
+choosesrc = choosesrc[:choosesrc.index("\ndef ", 1)]
+"{" not in choosesrc.split('"""')[2] or fail(
+    "the AppleScript must never be built out of anything")
+"CHOOSE_FILE_SCRIPT = 'POSIX path of (choose file" in src or fail(
+    "the picker script should be a plain constant")
+token = TOKEN_RE.search(r.data).group(1).decode()
+A.PENDING_IMPORTS[token]["source_path"] == picked or fail(
+    "the picked path should ride in the stash")
+picked.encode() not in r.data or fail(
+    "the path must not be rendered into the page as a field the user could edit")
+r = status(client.post("/import/commit", data={"token": token, "account_id": "1"}))
+b"Imported 2 new" in r.data or fail("a natively-picked file should import normally")
+native = batch_row()
+native["source_path"] == picked or fail(
+    f"the batch should store the absolute path, got {native['source_path']!r}")
+os.path.isabs(native["source_path"]) or fail("source_path should be absolute")
+r = status(import_page(mac=True))
+b"Reveal in Finder" in r.data or fail("a batch with a path should offer Reveal")
+f'value="{native["id"]}"'.encode() in r.data or fail(
+    "the Reveal form should carry the batch id")
+
+# 29E. Reveal hands Finder exactly the stored path, as argv, never a shell string
+shelled = seam()
+r = status(client.post("/import/reveal", data={"batch_id": str(native["id"])},
+                       follow_redirects=True))
+shelled == [["open", "-R", picked]] or fail(f"reveal ran {shelled}")
+b"Revealed in Finder" in r.data or fail("a successful reveal should say so")
+# a path from the REQUEST is ignored — only the DB's own column is ever used
+shelled = seam()
+r = status(client.post("/import/reveal", data={
+    "batch_id": str(native["id"]), "path": "/etc/passwd",
+    "source_path": "/etc/passwd; rm -rf /"}, follow_redirects=True))
+shelled == [["open", "-R", picked]] or fail(
+    f"reveal must ignore any path in the request, ran {shelled}")
+# ...and a path full of shell metacharacters stays ONE argument
+nasty = temp_csv(picked_csv("ODD"), "state ment; rm -rf x & $(id) `id` '\"quoted\"'.csv")
+nasty_batch = native_import(nasty)
+b"Imported 2 new" in nasty_batch.data or fail("a path with odd characters should import")
+odd = batch_row()
+shelled = seam()
+status(client.post("/import/reveal", data={"batch_id": str(odd["id"])},
+                   follow_redirects=True))
+shelled == [["open", "-R", nasty]] or fail(
+    f"an odd path must survive as one argv element, got {shelled}")
+len(shelled[0]) == 3 or fail("the path must never be split into extra arguments")
+# the seam itself takes a list and never asks for a shell
+runsrc = src[src.index("def run_command("):]
+runsrc = runsrc[:runsrc.index("\ndef ", 1)]
+"shell=True" not in runsrc and "shell =" not in runsrc or fail(
+    "run_command must never use a shell")
+"os.system" not in src and "shell=True" not in src or fail(
+    "nothing in the app may shell out through a string")
+
+# 29F. sad paths: no stored path, a file that moved, and not being on a mac
+shelled = seam()
+r = status(client.post("/import/reveal", data={"batch_id": str(uploaded["id"])},
+                       follow_redirects=True))
+b"No stored file for this import." in r.data or fail(
+    "revealing a browser-uploaded batch should say there is no file")
+shelled == [] or fail("a NULL path must not reach Finder at all")
+
+moved = temp_csv(picked_csv("MOVED"), "moved.csv")
+native_import(moved)
+gone_batch = batch_row()
+os.remove(moved)
+shelled = seam()
+r = status(client.post("/import/reveal", data={"batch_id": str(gone_batch["id"])},
+                       follow_redirects=True))
+b"That file has moved or been deleted." in r.data or fail(
+    "revealing a deleted file should say so")
+shelled == [] or fail("a missing file must not reach Finder")
+
+shelled = seam(mac=False)
+r = client.post("/import/reveal", data={"batch_id": str(native["id"])})
+SEEN.append(r.status_code)
+r.status_code == 501 or fail(f"reveal off-mac should be 501, got {r.status_code}")
+b"macOS-only" in r.data or fail("reveal off-mac should say it is macOS-only")
+shelled == [] or fail("nothing may be run off-mac")
+
+r = client.post("/import/choose", data={"account_id": "1"})
+SEEN.append(r.status_code)
+r.status_code == 501 or fail(f"the picker off-mac should be 501, got {r.status_code}")
+b"needs macOS" in r.data or fail("the picker off-mac should explain itself")
+b"Use the file upload instead" in r.data or fail(
+    "the 501 should point at the browser upload that still works")
+
+# a batch that no longer exists, and a batch_id that isn't a number
+for bad in ({"batch_id": "999999"}, {"batch_id": "not-a-number"}, {}):
+    seam()
+    r = status(client.post("/import/reveal", data=bad, follow_redirects=True))
+    r.status_code == 200 or fail(f"reveal({bad}) should not error")
+
+# 29G. the picker's own sad paths: cancel, an unreadable file, a bad account
+before = ledger_size()
+seam(returncode=1, stdout="")            # AppleScript's "User canceled. (-128)"
+r = status(client.post("/import/choose", data={"account_id": "1"},
+                       follow_redirects=True))
+b"No file chosen." in r.data or fail("cancelling the dialog should say no file chosen")
+seam(stdout="/no/such/file/at/all.csv\n")
+r = status(client.post("/import/choose", data={"account_id": "1"},
+                       follow_redirects=True))
+b"read that file." in r.data or fail(
+    "an unreadable picked file should be a note, not a crash")
+seam(stdout=picked + "\n")
+r = status(client.post("/import/choose", data={"account_id": "oops"},
+                       follow_redirects=True))
+r.status_code == 200 or fail("a bad account id should not error")
+ledger_size() == before or fail("no sad path may write to the ledger")
+
+# 29H. undo with the box UNticked: rows go, the file on disk is left alone
+keep = temp_csv(picked_csv("KEEP"), "keep_me.csv")
+native_import(keep)
+kept = batch_row()
+r = status(client.post("/import/undo", data={"batch_id": str(kept["id"])}))
+b"name=delete_file" in r.data or fail(
+    "the confirm screen should offer the file delete when there is a file")
+b"Off by default" in r.data or fail("the checkbox must say it is off by default")
+b"checked" not in r.data.split(b"delete_file")[1][:40] or fail(
+    "the file-delete checkbox must not be pre-ticked")
+rows_before = txn_count()
+r = status(client.post("/import/undo", data={"batch_id": str(kept["id"]), "confirm": "1"},
+                       follow_redirects=True))
+b"Removed 2 transactions" in r.data or fail("undo must still remove the rows")
+txn_count() == rows_before - 2 or fail("undo did not remove the transactions")
+batch_row(kept["id"]) is None or fail("undo did not remove the batch row")
+os.path.exists(keep) or fail(
+    "undo with the box unticked must leave the original file completely alone")
+
+# 29I. undo with the box TICKED: rows go, and so does that one file
+gone = temp_csv(picked_csv("DOOM"), "delete_me.csv")
+native_import(gone)
+doomed = batch_row()
+rows_before = txn_count()
+r = status(client.post("/import/undo", data={
+    "batch_id": str(doomed["id"]), "confirm": "1", "delete_file": "1"},
+    follow_redirects=True))
+b"Removed 2 transactions" in r.data or fail("undo must remove the rows first")
+b"The original file was deleted." in r.data or fail("the file delete should be reported")
+txn_count() == rows_before - 2 or fail("the transactions should be gone")
+batch_row(doomed["id"]) is None or fail("the batch row should be gone")
+os.path.exists(gone) and fail("the ticked box should have deleted the file")
+
+# 29J. a file that cannot be deleted NEVER blocks the ledger removal
+vanished = temp_csv(picked_csv("ORPHAN"), "already_gone.csv")
+native_import(vanished)
+orphan = batch_row()
+os.remove(vanished)                      # deleted behind the app's back
+rows_before = txn_count()
+r = status(client.post("/import/undo", data={
+    "batch_id": str(orphan["id"]), "confirm": "1", "delete_file": "1"},
+    follow_redirects=True))
+txn_count() == rows_before - 2 or fail(
+    "a failed file delete must not stop the transactions being removed")
+batch_row(orphan["id"]) is None or fail(
+    "a failed file delete must not stop the batch row being removed")
+b"could not be deleted" in r.data or fail("a failed file delete should be reported")
+# ...and a browser-uploaded batch has no file to offer at all
+r = status(import_csv("Date,Description,Amount\n09/04/2026,FAKE NOBOX CAFE,-3.00\n",
+                      "nobox.csv"))
+nobox = batch_row()
+r = status(client.post("/import/undo", data={"batch_id": str(nobox["id"])}))
+b"name=delete_file" not in r.data or fail(
+    "a batch with no stored file must not offer to delete one")
+status(client.post("/import/undo", data={"batch_id": str(nobox["id"]), "confirm": "1",
+                                         "delete_file": "1"}, follow_redirects=True))
+batch_row(nobox["id"]) is None or fail(
+    "undo must remove the batch even when a delete_file it never offered is forged")
+
+# 29K. the source path is read from the database and from nowhere else
+for fn in ("reveal_import", "undo_import"):
+    block = src[src.index(f"def {fn}("):]
+    block = block[:block.index("\ndef ", 1)]
+    for banned in ('request.form.get("path"', 'request.form["path"]',
+                   'request.form.get("source_path"', 'request.args.get("path"'):
+        banned not in block or fail(f"{fn} must never read a path from the request")
+    "source_path" in block or fail(f"{fn} should read the batch's own source_path")
+
+# 29L. no sad path anywhere in this section produced a 500
+set(SEEN) <= {200, 501} or fail(f"a route errored: {sorted(set(SEEN))}")
+
+A.is_mac, A.run_command = REAL_IS_MAC, REAL_RUN
+for folder in TEMP_DIRS:
+    for leaf in os.listdir(folder) if os.path.isdir(folder) else []:
+        os.remove(os.path.join(folder, leaf))
+    os.path.isdir(folder) and os.rmdir(folder)
 
 os.remove("_test.sqlite")
 for leftover in (PROFILES, PROFILES + ".tmp"):
