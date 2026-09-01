@@ -9,7 +9,9 @@ Ollama is not required — these exercise the deterministic rule + fallback path
 which is the behavior you must never break (the app has to work with AI off).
 """
 
+import ast
 import io
+import json
 import os
 import re
 import sqlite3
@@ -18,6 +20,15 @@ import sys
 os.environ["LEDGER_DB"] = "_test.sqlite"
 if os.path.exists("_test.sqlite"):
     os.remove("_test.sqlite")
+
+# Saved column profiles live in a JSON file, not in any ledger_YYYY.sqlite.
+# app.py resolves this at call time, so pointing it at a throwaway file here
+# keeps the suite hermetic and leaves the developer's own profiles alone.
+PROFILES = "_test_profiles.json"
+os.environ["LEDGER_PROFILES"] = PROFILES
+for leftover in (PROFILES, PROFILES + ".tmp"):
+    if os.path.exists(leftover):
+        os.remove(leftover)
 
 import app as A  # noqa: E402
 import db as D   # noqa: E402
@@ -1593,5 +1604,390 @@ code = handler.split('"""')[2]
 "import_batches" not in code or fail(
     "/transactions/bulk must not write to import_batches")
 
+# ---------------------------------------------------------------------------
+# 28A-28N. Saved column profiles. A bank's CSV layout belongs to the bank, not
+# to a year, so the store is ONE JSON file beside app.py — never a table in a
+# ledger_YYYY.sqlite. The name a column had when the profile was saved is what
+# makes it survive the bank reordering its export; the stored index is only the
+# fallback for when the header text changed but the layout didn't.
+# ---------------------------------------------------------------------------
+
+def profile_post(url, phase1, **fields):
+    """POST a profile route with the token off a live mapping page."""
+    found = TOKEN_RE.search(phase1.data)
+    found or fail("phase 1 did not render a mapping page")
+    data = {"token": found.group(1).decode(), "account_id": "1"}
+    data.update(fields)
+    return client.post(url, data=data)
+
+
+def upload_profiles(blob, name="profiles.json", token=None):
+    """POST a profiles file the way the Import button on the bar does."""
+    data = {"file": (io.BytesIO(blob), name)}
+    if token is not None:
+        data["token"] = token
+    return client.post("/import/profiles/import", data=data,
+                       content_type="multipart/form-data", follow_redirects=True)
+
+
+def profiles_on_disk():
+    """Read the store straight off the filesystem, not through load_profiles."""
+    with io.open(A.profiles_path(), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def fresh_store(text):
+    with io.open(A.profiles_path(), "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+A.profiles_path() == PROFILES or fail("the tests are not pointing at a temp store")
+A.profiles_path().endswith(".json") or fail("the profile store must be a JSON file")
+
+# The file the profile is saved from, and the same bank's export after a
+# redesign: same column NAMES, different order, plus a decoy "Memo" that
+# auto-detect prefers over the real Description.
+SAVE_SRC = ("Date,Description,Amount\n"
+            "09/01/2026,FAKE PROFILE SEED,-1.00\n")
+REORDER = ("Amount,Memo,Description,Date\n"
+           "-12.34,ignore this column,FAKE REORDER GROCER,09/05/2026\n")
+REORDER_HEADER = ["Amount", "Memo", "Description", "Date"]
+REORDER_ROW = ["-12.34", "ignore this column", "FAKE REORDER GROCER", "09/05/2026"]
+
+# 28A. THE MARQUEE: save from one layout, apply to a reordered one, by name.
+if os.path.exists(PROFILES):
+    os.remove(PROFILES)
+before = ledger_size()
+r = profile_post("/import/profile/save", upload_csv(SAVE_SRC, "profile_src.csv"),
+                 save_as="Towne Bank Checking", date_col="0", desc_col="1",
+                 amount_col="2", mode="single", sign="negative")
+r.status_code == 200 or fail(f"saving a profile returned {r.status_code}")
+b"Saved profile" in r.data or fail("saving a profile should say so on the page")
+saved = A.load_profiles()["profiles"].get("Towne Bank Checking")
+saved or fail("the saved profile is not in the store")
+saved["date"] == {"name": "Date", "index": 0} or fail(
+    f"a role stores its header name AND its index: {saved['date']}")
+saved["desc"] == {"name": "Description", "index": 1} or fail("desc role wrong")
+saved["amount"] == {"name": "Amount", "index": 2} or fail("amount role wrong")
+saved["mode"] == "single" and saved["sign"] == "negative" or fail(
+    "mode and sign travel with the profile")
+saved["debit"] is None and saved["credit"] is None or fail(
+    "a role the mapping never resolved should be stored as null")
+# saving from the real page submits every select, including the money group the
+# mode isn't using; that profile applies exactly the same way.
+r = profile_post("/import/profile/save", upload_csv(SAVE_SRC, "profile_full.csv"),
+                 save_as="Every select", date_col="0", desc_col="1", amount_col="2",
+                 debit_col="2", credit_col="2", mode="single", sign="negative")
+full = A.load_profiles()["profiles"]["Every select"]
+full["mode"] == "single" and full["debit"] == {"name": "Amount", "index": 2} or fail(
+    "a profile should keep the columns the page actually submitted")
+A.profile_to_mapping(full, ["Date", "Description", "Amount"]) == {
+    "date": 0, "desc": 1, "amount": 2, "debit": 2, "credit": 2,
+    "mode": "single", "sign": "negative"} or fail(
+    "an off-mode money role must not disturb the mode that is in use")
+
+# the decoy has to actually fool the detector, or applying proves nothing
+A.detect_columns(REORDER_HEADER)["desc"] == 1 or fail(
+    "the Memo decoy must be what auto-detect picks, else 28A can't discriminate")
+
+phase1 = upload_csv(REORDER, "reordered.csv")
+r = profile_post("/import/profile/apply", phase1, profile_name="Towne Bank Checking")
+r.status_code == 200 or fail(f"applying a profile returned {r.status_code}")
+b"Applied profile" in r.data or fail("applying a profile should say so")
+selected_col(r.data, "date_col") == 3 or fail(
+    f"date should resolve by name to column 3, got {selected_col(r.data, 'date_col')}")
+selected_col(r.data, "desc_col") == 2 or fail(
+    "description should resolve by name to column 2, not the Memo decoy")
+selected_col(r.data, "amount_col") == 0 or fail("amount should resolve by name to column 0")
+b"FAKE REORDER GROCER" in r.data or fail("the preview should read the real description")
+b"ignore this column" not in r.data or fail("the preview read the decoy Memo column")
+b"-$12.34" in r.data or fail("the preview should read the amount under the applied profile")
+b"row skipped under this mapping" not in r.data or fail(
+    "every row should be readable under the applied profile")
+ledger_size() == before or fail("saving or applying a profile wrote to the ledger")
+
+# ...and the same resolution, unit-level
+A.profile_to_mapping(saved, REORDER_HEADER) == {
+    "date": 3, "desc": 2, "amount": 0, "debit": None, "credit": None,
+    "mode": "single", "sign": "negative"} or fail(
+    "profile_to_mapping should resolve every role by name")
+# name matching is trimmed and case-insensitive
+A.profile_to_mapping(saved, ["  amount ", "MEMO", "  DESCRIPTION", "date"]) == {
+    "date": 3, "desc": 2, "amount": 0, "debit": None, "credit": None,
+    "mode": "single", "sign": "negative"} or fail(
+    "name matching should ignore case and surrounding space")
+# THE COUNTERFACTUAL: had resolution fallen back to the raw stored index, this
+# file would be unreadable — column 0 is the amount, not a date. That is what
+# makes the assertions above a test of name resolution and not of luck.
+A.read_row(REORDER_ROW, {"date": 0, "desc": 1, "amount": 2, "mode": "single",
+                         "sign": "negative"}) is None or fail(
+    "the stored-index mapping must be unreadable here, or 28A proves nothing")
+A.read_row(REORDER_ROW, A.profile_to_mapping(saved, REORDER_HEADER)) == \
+    ("2026-09-05", "FAKE REORDER GROCER", -1234) or fail(
+    "the name-resolved mapping should read the row exactly")
+
+# 28B. persistence: it is on disk, and a fresh read still finds it
+"Towne Bank Checking" in profiles_on_disk()["profiles"] or fail(
+    "the profile did not reach the file")
+profiles_on_disk()["version"] == 1 or fail("the store should carry version 1")
+A.load_profiles()["profiles"]["Towne Bank Checking"] == saved or fail(
+    "a re-read of the store should return the same profile")
+A.profile_names() == sorted(A.load_profiles()["profiles"]) or fail(
+    "profile_names should be the sorted names")
+
+# 28C. a missing, empty or corrupt store is an EMPTY store, never an exception
+keep = profiles_on_disk()
+for label, text in (("missing", None), ("empty", ""), ("blank", "   \n"),
+                    ("truncated", '{"version": 1, "profiles": {'),
+                    ("not JSON", "{ not json at all"),
+                    ("a list", "[1, 2, 3]"),
+                    ("profiles not a dict", '{"version":1,"profiles":"nope"}'),
+                    ("no profiles key", '{"version": 1}')):
+    if text is None:
+        os.path.exists(PROFILES) and os.remove(PROFILES)
+    else:
+        fresh_store(text)
+    A.load_profiles() == {"version": 1, "profiles": {}} or fail(
+        f"a {label} store should load as empty, got {A.load_profiles()}")
+    A.profile_names() == [] or fail(f"a {label} store should name no profiles")
+    client.get("/import").status_code == 200 or fail(
+        f"the import page should still render with a {label} store")
+    r = upload_csv(SAVE_SRC, "corrupt_store.csv")
+    r.status_code == 200 and b"Check the columns" in r.data or fail(
+        f"the mapping page should still render with a {label} store")
+
+# entries that aren't profiles are dropped; their well-formed neighbours survive
+fresh_store(json.dumps({"version": 1, "profiles": {
+    "Good": {"mode": "single", "sign": "negative",
+             "date": {"name": "Date", "index": 0},
+             "desc": {"name": "Description", "index": 1},
+             "amount": {"name": "Amount", "index": 2},
+             "debit": None, "credit": None},
+    "Bad mode": {"mode": "sideways", "date": None},
+    "Bad role": {"mode": "single", "date": "column one"},
+    "Bad index": {"mode": "single", "date": {"name": "Date", "index": "first"}},
+    "Not a dict": "nope",
+}}))
+list(A.load_profiles()["profiles"]) == ["Good"] or fail(
+    f"only well-formed entries should survive a load: {A.profile_names()}")
+
+A.save_profiles(keep)                       # back to the real store for 28D on
+
+# 28D. export is the store itself, as a download
+r = client.get("/import/profiles/export")
+r.status_code == 200 or fail(f"export returned {r.status_code}")
+r.mimetype == "application/json" or fail(f"export mimetype is {r.mimetype}")
+r.headers.get("Content-Disposition") == \
+    'attachment; filename="localledger-profiles.json"' or fail(
+    f"export disposition is {r.headers.get('Content-Disposition')!r}")
+json.loads(r.data.decode()) == A.load_profiles() or fail(
+    "the exported JSON should parse back equal to the store")
+
+# 28E. import merges by name: new profiles land, same-named ones are overwritten
+INCOMING = {"version": 1, "profiles": {
+    "Second Bank": {"mode": "debitcredit", "sign": "negative",
+                    "date": {"name": "Posted", "index": 0},
+                    "desc": {"name": "Payee", "index": 1},
+                    "amount": None,
+                    "debit": {"name": "Withdrawal", "index": 2},
+                    "credit": {"name": "Deposit", "index": 3}},
+    "Towne Bank Checking": {"mode": "single", "sign": "positive",
+                            "date": {"name": "Transaction Date", "index": 9},
+                            "desc": {"name": "Narrative", "index": 8},
+                            "amount": {"name": "Value", "index": 7},
+                            "debit": None, "credit": None},
+    "Junk": "not a profile at all",
+    "Also junk": {"mode": "sideways"},
+}}
+phase1 = upload_csv(SAVE_SRC, "merge_target.csv")
+token = TOKEN_RE.search(phase1.data).group(1).decode()
+r = upload_profiles(json.dumps(INCOMING).encode(), token=token)
+r.status_code == 200 or fail(f"importing profiles returned {r.status_code}")
+b"Imported 2 profiles" in r.data or fail(
+    "two well-formed profiles should import and the malformed ones be skipped")
+store = A.load_profiles()["profiles"]
+"Second Bank" in store or fail("the new profile was not added")
+store["Second Bank"]["debit"] == {"name": "Withdrawal", "index": 2} or fail(
+    "a debit/credit profile should import whole")
+store["Towne Bank Checking"]["date"] == {"name": "Transaction Date", "index": 9} \
+    or fail("a same-named profile should be overwritten by the imported one")
+store["Towne Bank Checking"]["sign"] == "positive" or fail("sign should be overwritten too")
+"Junk" not in store and "Also junk" not in store or fail(
+    "malformed entries must be skipped, not stored")
+
+# ...and a file that is not a profiles file changes nothing and never 500s
+for label, blob in (("not JSON", b"{ nope"), ("a list", b"[1,2,3]"),
+                    ("no profiles key", b'{"version": 1}'),
+                    ("profiles not a dict", b'{"version":1,"profiles":[]}'),
+                    ("empty", b""),
+                    ("oversized", b'{"version":1,"profiles":{}}'
+                                  + b" " * (A.MAX_PROFILE_FILE + 1))):
+    intact = A.load_profiles()
+    r = upload_profiles(blob, f"{label}.json", token=token)
+    r.status_code == 200 or fail(f"a {label} profiles file returned {r.status_code}")
+    b"read that profiles file" in r.data or fail(
+        f"a {label} profiles file should surface an error")
+    A.load_profiles() == intact or fail(f"a {label} profiles file changed the store")
+# no file at all is the same story, and it still renders
+r = client.post("/import/profiles/import", data={"token": token},
+                content_type="multipart/form-data", follow_redirects=True)
+r.status_code == 200 or fail("importing with no file chosen should still render")
+# an expired/absent token falls back to the import page rather than crashing
+r = upload_profiles(json.dumps(INCOMING).encode())
+r.status_code == 200 or fail("importing profiles without a token should still render")
+b"Imported 2 profiles" in r.data or fail("the note should ride the redirect")
+
+# 28F. a role whose name is gone falls back to its index — if that is in range
+A.save_profiles({"version": 1, "profiles": {
+    "Index fallback": {"mode": "single", "sign": "negative",
+                       "date": {"name": "Gone Date", "index": 0},
+                       "desc": {"name": "Gone Desc", "index": 1},
+                       "amount": {"name": "Gone Amount", "index": 2},
+                       "debit": None, "credit": None},
+    "Out of range": {"mode": "single", "sign": "negative",
+                     "date": {"name": "Gone Date", "index": 99},
+                     "desc": {"name": "Gone Desc", "index": None},
+                     "amount": {"name": "Gone Amount", "index": -1},
+                     "debit": None, "credit": None},
+}})
+store = A.load_profiles()["profiles"]
+A.profile_to_mapping(store["Index fallback"], ["Date", "Description", "Amount"]) == {
+    "date": 0, "desc": 1, "amount": 2, "debit": None, "credit": None,
+    "mode": "single", "sign": "negative"} or fail(
+    "an absent name should fall back to the stored index")
+A.profile_to_mapping(store["Out of range"], ["Date", "Description", "Amount"]) == {
+    "date": None, "desc": None, "amount": None, "debit": None, "credit": None,
+    "mode": "single", "sign": "negative"} or fail(
+    "an out-of-range or missing index should resolve to None, not an exception")
+# ...and applying that unresolvable profile renders the page instead of crashing
+before = ledger_size()
+r = profile_post("/import/profile/apply", upload_csv(SAVE_SRC, "fallback.csv"),
+                 profile_name="Out of range")
+r.status_code == 200 or fail(f"applying an unresolvable profile returned {r.status_code}")
+b"Check the columns" in r.data or fail("the mapping page should still render")
+b"row skipped under this mapping" in r.data or fail(
+    "rows unreadable under an unresolvable profile should show as skipped")
+selected_col(r.data, "date_col") is None or fail(
+    "an unresolved role should leave its select with nothing chosen")
+ledger_size() == before or fail("applying a profile wrote to the ledger")
+
+# 28G. delete removes it, and the removal persists
+r = profile_post("/import/profile/delete", upload_csv(SAVE_SRC, "delete.csv"),
+                 profile_name="Out of range")
+r.status_code == 200 or fail(f"deleting a profile returned {r.status_code}")
+b"Deleted profile" in r.data or fail("deleting a profile should say so")
+"Out of range" not in A.load_profiles()["profiles"] or fail("delete did not remove it")
+"Out of range" not in profiles_on_disk()["profiles"] or fail("delete did not persist")
+"Index fallback" in A.load_profiles()["profiles"] or fail("delete took a neighbour with it")
+# deleting something that isn't there is a note, not an error
+r = profile_post("/import/profile/delete", upload_csv(SAVE_SRC, "delete2.csv"),
+                 profile_name="Out of range")
+r.status_code == 200 and b"No profile named" in r.data or fail(
+    "deleting an unknown profile should say so and not crash")
+
+# 28H. an unknown profile, and a blank save name, change nothing
+intact = A.load_profiles()
+r = profile_post("/import/profile/apply", upload_csv(SAVE_SRC, "unknown.csv"),
+                 profile_name="Nothing By This Name")
+r.status_code == 200 and b"No profile named" in r.data or fail(
+    "applying an unknown profile should say so")
+A.load_profiles() == intact or fail("applying an unknown profile changed the store")
+for blank in ("", "   "):
+    r = profile_post("/import/profile/save", upload_csv(SAVE_SRC, "blank.csv"),
+                     save_as=blank, date_col="0", desc_col="1", amount_col="2")
+    r.status_code == 200 or fail("a blank profile name should re-render the page")
+    b"Name the profile before saving it." in r.data or fail(
+        "a blank profile name should be refused with a note")
+    A.load_profiles() == intact or fail("a blank name saved something")
+
+# 28I. profile names are escaped everywhere they are rendered
+NASTY = "<script>alert(1)</script>"
+r = profile_post("/import/profile/save", upload_csv(SAVE_SRC, "xss.csv"),
+                 save_as=NASTY, date_col="0", desc_col="1", amount_col="2",
+                 mode="single", sign="negative")
+NASTY in A.load_profiles()["profiles"] or fail("the profile should save under its odd name")
+b"<script>alert(1)</script>" not in r.data or fail(
+    "a profile name must never render as markup")
+b"&lt;script&gt;alert(1)&lt;/script&gt;" in r.data or fail(
+    "the profile name should render escaped")
+# ...in the picker, the note and the selected option alike
+r = profile_post("/import/profile/apply", upload_csv(SAVE_SRC, "xss2.csv"),
+                 profile_name=NASTY)
+b"<script>alert(1)</script>" not in r.data or fail(
+    "the profile picker must escape names too")
+r.data.count(b"&lt;script&gt;alert(1)&lt;/script&gt;") >= 2 or fail(
+    "the name should be escaped in both the picker and the note")
+profile_post("/import/profile/delete", upload_csv(SAVE_SRC, "xss3.csv"),
+             profile_name=NASTY)
+NASTY not in A.load_profiles()["profiles"] or fail("cleanup of the odd name failed")
+
+# 28J. the bar is plain forms — every control posts to a real route
+phase1 = upload_csv(SAVE_SRC, "bar.csv")
+bar = re.search(rb"<div class=profiles>.*?</div>", phase1.data, re.S)
+bar or fail("the mapping page is missing the profiles bar")
+bar = bar.group(0)
+for hook in (b'formaction="/import/profile/apply"', b'formaction="/import/profile/save"',
+             b'formaction="/import/profile/delete"', b'href="/import/profiles/export"',
+             b"<select name=profile_name>", b"name=save_as",
+             b"<input type=file name=file accept=.json form=profile-file>"):
+    hook in bar or fail(f"the profiles bar is missing {hook!r}")
+b'action="/import/profiles/import"' in phase1.data or fail(
+    "the file-import form is missing from the mapping page")
+b"enctype=multipart/form-data" in phase1.data or fail(
+    "the file-import form must be multipart")
+
+# 28K. NO JavaScript was added: not in the bar, not in the routes behind it
+for banned in (b"<script", b"onclick", b"onchange", b"onsubmit", b"addEventListener",
+               b"fetch(", b"javascript:"):
+    banned not in bar or fail(f"the profiles bar must contain no {banned!r}")
+src = io.open("app.py", encoding="utf-8").read()
+for fn in ("profiles_bar", "save_profile", "apply_profile", "delete_profile",
+           "export_profiles", "import_profiles", "load_profiles", "save_profiles",
+           "profile_to_mapping", "mapping_to_profile"):
+    block = src[src.index(f"def {fn}("):]
+    block = block[:block.index("\ndef ", 1)]
+    for banned in ("<script", "onclick", "addEventListener", "jsonify", "http://",
+                   "https://"):
+        banned not in block or fail(f"{fn} should not contain {banned!r}")
+# the mapping page carries exactly the two script blocks it already had: the
+# base template's transactions-grid editor and the money-style toggle. The
+# profiles bar added none.
+phase1.data.count(b"<script>") == 2 or fail(
+    f"the mapping page should still have 2 script blocks, has "
+    f"{phase1.data.count(b'<script>')}")
+
+# 28L. no schema change: the store is a JSON file, db.py knows nothing about it
+dbsrc = io.open("db.py", encoding="utf-8").read()
+"profile" not in dbsrc.lower() or fail("db.py must not know about profiles")
+for fn in ("load_profiles", "save_profiles", "profile_to_mapping", "save_profile",
+           "apply_profile", "delete_profile", "export_profiles", "import_profiles"):
+    block = src[src.index(f"def {fn}("):]
+    block = block[:block.index("\ndef ", 1)]
+    for banned in ("CREATE TABLE", "ALTER TABLE", "get_conn(", "sqlite"):
+        banned not in block or fail(f"{fn} touches the database ({banned})")
+have = {r["name"] for r in conn.execute(
+    "SELECT name FROM sqlite_master WHERE type='table'")}
+have == {"accounts", "categories", "merchant_rules", "import_batches", "transactions",
+         "transfers", "allocations", "documents", "attachments"} or fail(
+    f"the schema changed: {sorted(have)}")
+os.path.exists(PROFILES) or fail("the store should be its own file on disk")
+
+# 28M. no new dependency: stdlib plus Flask, exactly as before
+tree = ast.parse(src)
+imports = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        imports |= {a.name.split(".")[0] for a in node.names}
+    elif isinstance(node, ast.ImportFrom) and node.module:
+        imports.add(node.module.split(".")[0])
+imports == {"csv", "html", "io", "json", "os", "secrets", "sqlite3", "datetime",
+            "decimal", "flask", "db", "categorizer"} or fail(
+    f"app.py's imports changed: {sorted(imports)}")
+io.open("requirements.txt", encoding="utf-8").read().split() == ["flask>=3.0"] or fail(
+    "requirements.txt should still name Flask alone")
+
 os.remove("_test.sqlite")
+for leftover in (PROFILES, PROFILES + ".tmp"):
+    if os.path.exists(leftover):
+        os.remove(leftover)
 print("ALL TESTS PASSED")

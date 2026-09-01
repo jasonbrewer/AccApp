@@ -4,3 +4,5 @@ ledger_*.sqlite*
 _test.sqlite*
 *.csv
 !sample_statement.csv
+localledger_profiles.json*
+_test_profiles.json*
